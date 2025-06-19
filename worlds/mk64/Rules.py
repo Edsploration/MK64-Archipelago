@@ -201,10 +201,10 @@ def create_rules(world: "MK64World") -> None:
             if group == Group.base:
                 if code % 3 < 2:
                     set_rule(world.get_location(name),
-                             lambda state: course_win_rules[(code - 4660000) // 3](state, player, opt.logic))
+                             lambda state, c=code: course_win_rules[(c - 4660000) // 3](state, player, opt.logic))
                 else:
                     set_rule(world.get_location(name),
-                             lambda state: course_qualify_rules[(code - 4660000) // 3](state, player, opt.logic))
+                             lambda state, c=code: course_qualify_rules[(c - 4660000) // 3](state, player, opt.logic))
 
     # Item Spot Access Rules moved to Regions.py for context that knows which item box spots to apply rules to
 
