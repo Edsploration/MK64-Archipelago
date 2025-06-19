@@ -47,21 +47,21 @@ class LogicDifficulty(Choice):
     """Scales the logic threshhold where skill is involved. Specifically, how many good items are available before you
     are expected to be able to qualify and win on tough courses.
 
-    Basic: Balanced runs for a competent karter.
-
-    Advanced: Low logic, high randomness, high skill. Few good items may be available early in the run.
-
-    Generous: Makes sure you have plenty of good items early. For easier play, or skipping 50 cc.
-    (Generous is more likely to fail generation. To raise chances try increasing shuffle_item_box_clusters and
+    Basic: Makes sure you have plenty of good items early. For easier play, or skipping 50 cc.
+    (Basic is more likely to fail generation. To raise chances try increasing shuffle_item_box_clusters and
     minimum_filler_items. Future versions will be less fragile to generation failure.)
 
-    No Logic: If fences are enabled, THE RUN MAY BE IMPOSSIBLE!"""
+    Advanced: Balanced runs for a competent karter.
+
+    Expert: Low logic, high randomness, high skill. Few good items may be available early in the run.
+
+    No Logic: If fences are enabled, THE RUN MAY BE NEAR IMPOSSIBLE!"""
     display_name = "Logic Difficulty"
-    option_basic = 3
-    option_advanced = 0
-    option_generous = 6
+    option_basic = 6
+    option_advanced = 3
+    option_expert = 0
     option_no_logic = -100
-    default = 3
+    default = 6
 
 
 class LockedCourses(Range):

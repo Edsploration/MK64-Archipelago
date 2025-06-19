@@ -52,13 +52,13 @@ def determine_order(world: "MK64World") -> list[int]:
                 return order
             while True:  # do-while loop to choose good starting courses
                 match opt.logic:
-                    case LogicDifficulty.option_generous:
+                    case LogicDifficulty.option_basic:
                         first = random.choice(easy_course_pool)
                         second = random.choice(medium_course_pool)
-                    case LogicDifficulty.option_basic:
+                    case LogicDifficulty.option_advanced:
                         first = random.choice(medium_course_pool)
                         second = random.choice(hard_course_pool)
-                    case _:  # LogicDifficulty.option_advanced
+                    case _:  # LogicDifficulty.option_expert
                         first = random.choice(hard_course_pool)
                         second = random.randrange(16)
                 if first != second and first != final and second != final:
