@@ -76,8 +76,8 @@ def generate_rom_patch(world: "MK64World", output_directory: str) -> None:
     multiworld = world.multiworld
     player = world.player
     opt = world.opt
+    random = world.random
 
-    random = multiworld.per_slot_randoms[player]
     base_out_path = os.path.join(output_directory, multiworld.get_out_file_name_base(player))
     patch_path = base_out_path + MK64DeltaPatch.patch_file_ending     # AP_<seed>_<player>.apmk64
     rom_out_path = base_out_path + MK64DeltaPatch.result_file_ending  # AP_<seed>_<player>.z64
