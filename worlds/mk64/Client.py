@@ -97,7 +97,7 @@ class MarioKart64Client(BizHawkClient):
                 local_id = receive_item.item - ID_BASE
                 receive_player = unicodedata.normalize("NFKD", ctx.player_names[receive_item.player])\
                                             .encode("ascii", "ignore")[:Addr.ASCII_PLAYER_NAME_SIZE]
-                receive_item_name = unicodedata.normalize("NFKD", ctx.item_names[receive_item.item])\
+                receive_item_name = unicodedata.normalize("NFKD", ctx.item_names.lookup_in_game(receive_item.item))\
                                                .encode("ascii", "ignore")[:Addr.ITEM_NAME_SIZE]
                 await bizhawk.guarded_write(ctx.bizhawk_ctx,
                     [(Addr.RECEIVE_ITEM_ID, local_id.to_bytes(1, "big"), "RDRAM"),
