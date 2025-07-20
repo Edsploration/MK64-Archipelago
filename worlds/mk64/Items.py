@@ -67,6 +67,7 @@ def create_items(world: "MK64World"):
             itempool += [create_item("Progressive Course", player) for _ in range(opt.locked_courses)]
 
     # Create items based on player options
+    world.starting_karts = []
     cluster_id = 0
     karts = []
     filler_items = []

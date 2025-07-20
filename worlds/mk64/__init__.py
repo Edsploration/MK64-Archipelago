@@ -63,7 +63,7 @@ class MK64World(World):
     victory_location: MK64Location
     event_names: list[str]
     course_order: list[int]
-    starting_karts: list[str] = []
+    starting_karts: list[str]
 
     @classmethod
     def stage_assert_generate(cls, multiworld: MultiWorld):
