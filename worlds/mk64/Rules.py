@@ -66,7 +66,7 @@ def winter_score(state: CollectionState, player: int) -> int:  # 0 to 4
 def fence_score(state: CollectionState, player: int) -> int:  # 0 to 8  # TODO: Check for feather item boxes on course
     switch_ratings = [0, 4, 6, 7, 8]
     feather_ratings = [2, 1, 0, 0, 0]
-    switch_count = state.count_group("Switches", player)
+    switch_count = state.count_group_unique("Switches", player)
     return (switch_ratings[switch_count]
             + (state.has_any({"Feather Power", "P2 Feather Power"}, player) and feather_ratings[switch_count]))
 
