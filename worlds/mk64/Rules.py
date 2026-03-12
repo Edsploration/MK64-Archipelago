@@ -118,7 +118,7 @@ course_qualify_rules = [    # TODO: Refactor with coupling among score types aft
                                              + state.has("Railings Yoshi Valley Maze", player)),
     lambda state, player, ease: ease + 3 <= (score_track_qualify(state, player)                  # Banshee Boardwalk
                                              + state.has("Railings Banshee Boardwalk North", player)
-                                             + state.has("Railings Banshee Boardwalk North", player)),
+                                             + state.has("Railings Banshee Boardwalk South", player)),
     lambda state, player, ease: ease + 4 <= (score_track_qualify(state, player)                  # Rainbow Road
                                              + 2 * state.has("Railings Rainbow Road 1", player)
                                              + 2 * state.has("Railings Rainbow Road 2", player)
@@ -149,7 +149,7 @@ course_win_rules = [    # TODO: Refactor with coupling among score types after m
                                              + state.has("Railings Yoshi Valley Maze", player)),
     lambda state, player, ease: ease + 5 <= (score_track_win(state, player)                      # Banshee Boardwalk
                                              + state.has("Railings Banshee Boardwalk North", player)
-                                             + state.has("Railings Banshee Boardwalk North", player)),
+                                             + state.has("Railings Banshee Boardwalk South", player)),
     lambda state, player, ease: ease + 6 <= (score_track_win(state, player)                      # Rainbow Road
                                              + 2 * state.has("Railings Rainbow Road 1", player)
                                              + 2 * state.has("Railings Rainbow Road 2", player)
