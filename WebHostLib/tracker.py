@@ -1,10 +1,11 @@
 import datetime
 import collections
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, NamedTuple, Counter
 from uuid import UUID
+from email.utils import parsedate_to_datetime
 
-from flask import render_template
+from flask import make_response, render_template, request, Request, Response
 from werkzeug.exceptions import abort
 
 from MultiServer import Context, get_saving_second
@@ -16,7 +17,6 @@ from .models import GameDataPackage, Room
 # Multisave is currently updated, at most, every minute.
 TRACKER_CACHE_TIMEOUT_IN_SECONDS = 60
 
-_multidata_cache = {}
 _multiworld_trackers: Dict[str, Callable] = {}
 _player_trackers: Dict[str, Callable] = {}
 
@@ -78,33 +78,33 @@ class TrackerData:
 
             # Normal lookup tables as well.
             self.item_name_to_id[game] = game_package["item_name_to_id"]
-            self.location_name_to_id[game] = game_package["item_name_to_id"]
+            self.location_name_to_id[game] = game_package["location_name_to_id"]
 
     def get_seed_name(self) -> str:
         """Retrieves the seed name."""
         return self._multidata["seed_name"]
 
-    def get_slot_data(self, team: int, player: int) -> Dict[str, Any]:
+    def get_slot_data(self, player: int) -> Dict[str, Any]:
         """Retrieves the slot data for a given player."""
         return self._multidata["slot_data"][player]
 
-    def get_slot_info(self, team: int, player: int) -> NetworkSlot:
+    def get_slot_info(self, player: int) -> NetworkSlot:
         """Retrieves the NetworkSlot data for a given player."""
         return self._multidata["slot_info"][player]
 
-    def get_player_name(self, team: int, player: int) -> str:
+    def get_player_name(self, player: int) -> str:
         """Retrieves the slot name for a given player."""
-        return self.get_slot_info(team, player).name
+        return self.get_slot_info(player).name
 
-    def get_player_game(self, team: int, player: int) -> str:
+    def get_player_game(self, player: int) -> str:
         """Retrieves the game for a given player."""
-        return self.get_slot_info(team, player).game
+        return self.get_slot_info(player).game
 
-    def get_player_locations(self, team: int, player: int) -> Dict[int, ItemMetadata]:
+    def get_player_locations(self, player: int) -> Dict[int, ItemMetadata]:
         """Retrieves all locations with their containing item's metadata for a given player."""
         return self._multidata["locations"][player]
 
-    def get_player_starting_inventory(self, team: int, player: int) -> List[int]:
+    def get_player_starting_inventory(self, player: int) -> List[int]:
         """Retrieves a list of all item codes a given slot starts with."""
         return self._multidata["precollected_items"][player]
 
@@ -115,7 +115,7 @@ class TrackerData:
     @_cache_results
     def get_player_missing_locations(self, team: int, player: int) -> Set[int]:
         """Retrieves the set of all locations not marked complete by this player."""
-        return set(self.get_player_locations(team, player)) - self.get_player_checked_locations(team, player)
+        return set(self.get_player_locations(player)) - self.get_player_checked_locations(team, player)
 
     def get_player_received_items(self, team: int, player: int) -> List[NetworkItem]:
         """Returns all items received to this player in order of received."""
@@ -124,10 +124,13 @@ class TrackerData:
     @_cache_results
     def get_player_inventory_counts(self, team: int, player: int) -> collections.Counter:
         """Retrieves a dictionary of all items received by their id and their received count."""
-        items = self.get_player_received_items(team, player)
+        received_items = self.get_player_received_items(team, player)
+        starting_items = self.get_player_starting_inventory(player)
         inventory = collections.Counter()
-        for item in items:
+        for item in received_items:
             inventory[item.item] += 1
+        for item in starting_items:
+            inventory[item] += 1
 
         return inventory
 
@@ -175,7 +178,7 @@ class TrackerData:
     def get_team_locations_total_count(self) -> Dict[int, int]:
         """Retrieves a dictionary of total player locations each team has."""
         return {
-            team: sum(len(self.get_player_locations(team, player)) for player in players)
+            team: sum(len(self.get_player_locations(player)) for player in players)
             for team, players in self.get_all_players().items()
         }
 
@@ -206,7 +209,7 @@ class TrackerData:
         return {
             0: [
                 player for player, slot_info in self._multidata["slot_info"].items()
-                if self.get_slot_info(0, player).type == SlotType.player
+                if self.get_slot_info(player).type == SlotType.player
             ]
         }
 
@@ -222,7 +225,7 @@ class TrackerData:
     def get_room_locations(self) -> Dict[TeamPlayer, Dict[int, ItemMetadata]]:
         """Retrieves a dictionary of all locations and their associated item metadata per player."""
         return {
-            (team, player): self.get_player_locations(team, player)
+            (team, player): self.get_player_locations(player)
             for team, players in self.get_all_players().items() for player in players
         }
 
@@ -230,7 +233,7 @@ class TrackerData:
     def get_room_games(self) -> Dict[TeamPlayer, str]:
         """Retrieves a dictionary of games for each player."""
         return {
-            (team, player): self.get_player_game(team, player)
+            (team, player): self.get_player_game(player)
             for team, players in self.get_all_slots().items() for player in players
         }
 
@@ -258,9 +261,9 @@ class TrackerData:
             for player in players:
                 alias = self.get_player_alias(team, player)
                 if alias:
-                    long_player_names[team, player] = f"{alias} ({self.get_player_name(team, player)})"
+                    long_player_names[team, player] = f"{alias} ({self.get_player_name(player)})"
                 else:
-                    long_player_names[team, player] = self.get_player_name(team, player)
+                    long_player_names[team, player] = self.get_player_name(player)
 
         return long_player_names
 
@@ -288,57 +291,106 @@ class TrackerData:
 
         return video_feeds
 
+    @_cache_results
+    def get_spheres(self) -> List[List[int]]:
+        """ each sphere is { player: { location_id, ... } } """
+        return self._multidata.get("spheres", [])
+
+
+def _process_if_request_valid(incoming_request: Request, room: Optional[Room]) -> Optional[Response]:
+    if not room:
+        abort(404)
+
+    if_modified_str: Optional[str] = incoming_request.headers.get("If-Modified-Since", None)
+    if if_modified_str:
+        if_modified = parsedate_to_datetime(if_modified_str)
+        if if_modified.tzinfo is None:
+            abort(400)  # standard requires "GMT" timezone
+        # database may use datetime.utcnow(), which is timezone-naive. convert to timezone-aware.
+        last_activity = room.last_activity
+        if last_activity.tzinfo is None:
+            last_activity = room.last_activity.replace(tzinfo=datetime.timezone.utc)
+        # if_modified has less precision than last_activity, so we bring them to same precision
+        if if_modified >= last_activity.replace(microsecond=0):
+            return make_response("",  304)
+
+    return None
+
 
 @app.route("/tracker/<suuid:tracker>/<int:tracked_team>/<int:tracked_player>")
-def get_player_tracker(tracker: UUID, tracked_team: int, tracked_player: int, generic: bool = False) -> str:
+def get_player_tracker(tracker: UUID, tracked_team: int, tracked_player: int, generic: bool = False) -> Response:
     key = f"{tracker}_{tracked_team}_{tracked_player}_{generic}"
-    tracker_page = cache.get(key)
-    if tracker_page:
-        return tracker_page
+    response: Optional[Response] = cache.get(key)
+    if response:
+        return response
 
-    timeout, tracker_page = get_timeout_and_tracker(tracker, tracked_team, tracked_player, generic)
-    cache.set(key, tracker_page, timeout)
-    return tracker_page
-
-
-@app.route("/generic_tracker/<suuid:tracker>/<int:tracked_team>/<int:tracked_player>")
-def get_generic_game_tracker(tracker: UUID, tracked_team: int, tracked_player: int) -> str:
-    return get_player_tracker(tracker, tracked_team, tracked_player, True)
-
-
-@app.route("/tracker/<suuid:tracker>", defaults={"game": "Generic"})
-@app.route("/tracker/<suuid:tracker>/<game>")
-@cache.memoize(timeout=TRACKER_CACHE_TIMEOUT_IN_SECONDS)
-def get_multiworld_tracker(tracker: UUID, game: str):
     # Room must exist.
     room = Room.get(tracker=tracker)
-    if not room:
-        abort(404)
 
-    tracker_data = TrackerData(room)
-    enabled_trackers = list(get_enabled_multiworld_trackers(room).keys())
-    if game not in _multiworld_trackers:
-        return render_generic_multiworld_tracker(tracker_data, enabled_trackers)
+    response = _process_if_request_valid(request, room)
+    if response:
+        return response
 
-    return _multiworld_trackers[game](tracker_data, enabled_trackers)
+    timeout, last_modified, tracker_page = get_timeout_and_player_tracker(room, tracked_team, tracked_player, generic)
+    response = make_response(tracker_page)
+    response.last_modified = last_modified
+    cache.set(key, response, timeout)
+    return response
 
 
-def get_timeout_and_tracker(tracker: UUID, tracked_team: int, tracked_player: int, generic: bool) -> Tuple[int, str]:
-    # Room must exist.
-    room = Room.get(tracker=tracker)
-    if not room:
-        abort(404)
-
+def get_timeout_and_player_tracker(room: Room, tracked_team: int, tracked_player: int, generic: bool)\
+        -> Tuple[int, datetime.datetime, str]:
     tracker_data = TrackerData(room)
 
     # Load and render the game-specific player tracker, or fallback to generic tracker if none exists.
-    game_specific_tracker = _player_trackers.get(tracker_data.get_player_game(tracked_team, tracked_player), None)
+    game_specific_tracker = _player_trackers.get(tracker_data.get_player_game(tracked_player), None)
     if game_specific_tracker and not generic:
         tracker = game_specific_tracker(tracker_data, tracked_team, tracked_player)
     else:
         tracker = render_generic_tracker(tracker_data, tracked_team, tracked_player)
 
-    return (tracker_data.get_room_saving_second() - datetime.datetime.now().second) % 60 or 60, tracker
+    return ((tracker_data.get_room_saving_second() - datetime.datetime.now().second)
+            % TRACKER_CACHE_TIMEOUT_IN_SECONDS or TRACKER_CACHE_TIMEOUT_IN_SECONDS, room.last_activity, tracker)
+
+
+@app.route("/generic_tracker/<suuid:tracker>/<int:tracked_team>/<int:tracked_player>")
+def get_generic_game_tracker(tracker: UUID, tracked_team: int, tracked_player: int) -> Response:
+    return get_player_tracker(tracker, tracked_team, tracked_player, True)
+
+
+@app.route("/tracker/<suuid:tracker>", defaults={"game": "Generic"})
+@app.route("/tracker/<suuid:tracker>/<game>")
+def get_multiworld_tracker(tracker: UUID, game: str) -> Response:
+    key = f"{tracker}_{game}"
+    response: Optional[Response] = cache.get(key)
+    if response:
+        return response
+
+    # Room must exist.
+    room = Room.get(tracker=tracker)
+
+    response = _process_if_request_valid(request, room)
+    if response:
+        return response
+
+    timeout, last_modified, tracker_page = get_timeout_and_multiworld_tracker(room, game)
+    response = make_response(tracker_page)
+    response.last_modified = last_modified
+    cache.set(key, response, timeout)
+    return response
+
+
+def get_timeout_and_multiworld_tracker(room: Room, game: str)\
+        -> Tuple[int, datetime.datetime, str]:
+    tracker_data = TrackerData(room)
+    enabled_trackers = list(get_enabled_multiworld_trackers(room).keys())
+    if game in _multiworld_trackers:
+        tracker = _multiworld_trackers[game](tracker_data, enabled_trackers)
+    else:
+        tracker = render_generic_multiworld_tracker(tracker_data, enabled_trackers)
+
+    return ((tracker_data.get_room_saving_second() - datetime.datetime.now().second)
+            % TRACKER_CACHE_TIMEOUT_IN_SECONDS or TRACKER_CACHE_TIMEOUT_IN_SECONDS, room.last_activity, tracker)
 
 
 def get_enabled_multiworld_trackers(room: Room) -> Dict[str, Callable]:
@@ -356,22 +408,26 @@ def get_enabled_multiworld_trackers(room: Room) -> Dict[str, Callable]:
 
 
 def render_generic_tracker(tracker_data: TrackerData, team: int, player: int) -> str:
-    game = tracker_data.get_player_game(team, player)
+    game = tracker_data.get_player_game(player)
 
-    # Add received index to all received items, excluding starting inventory.
     received_items_in_order = {}
-    for received_index, network_item in enumerate(tracker_data.get_player_received_items(team, player), start=1):
-        received_items_in_order[network_item.item] = received_index
+    starting_inventory = tracker_data.get_player_starting_inventory(player)
+    for index, item in enumerate(starting_inventory):
+        received_items_in_order[item] = index
+    for index, network_item in enumerate(tracker_data.get_player_received_items(team, player),
+                                         start=len(starting_inventory)):
+        received_items_in_order[network_item.item] = index
 
     return render_template(
         template_name_or_list="genericTracker.html",
         game_specific_tracker=game in _player_trackers,
         room=tracker_data.room,
+        get_slot_info=tracker_data.get_slot_info,
         team=team,
         player=player,
         player_name=tracker_data.get_room_long_player_names()[team, player],
         inventory=tracker_data.get_player_inventory_counts(team, player),
-        locations=tracker_data.get_player_locations(team, player),
+        locations=tracker_data.get_player_locations(player),
         checked_locations=tracker_data.get_player_checked_locations(team, player),
         received_items=received_items_in_order,
         saving_second=tracker_data.get_room_saving_second(),
@@ -390,6 +446,7 @@ def render_generic_multiworld_tracker(tracker_data: TrackerData, enabled_tracker
         enabled_trackers=enabled_trackers,
         current_tracker="Generic",
         room=tracker_data.room,
+        get_slot_info=tracker_data.get_slot_info,
         all_slots=tracker_data.get_all_slots(),
         room_players=tracker_data.get_all_players(),
         locations=tracker_data.get_room_locations(),
@@ -405,7 +462,28 @@ def render_generic_multiworld_tracker(tracker_data: TrackerData, enabled_tracker
         videos=tracker_data.get_room_videos(),
         item_id_to_name=tracker_data.item_id_to_name,
         location_id_to_name=tracker_data.location_id_to_name,
+        saving_second=tracker_data.get_room_saving_second(),
     )
+
+
+def render_generic_multiworld_sphere_tracker(tracker_data: TrackerData) -> str:
+    return render_template(
+        "multispheretracker.html",
+        room=tracker_data.room,
+        tracker_data=tracker_data,
+    )
+
+
+@app.route("/sphere_tracker/<suuid:tracker>")
+@cache.memoize(timeout=TRACKER_CACHE_TIMEOUT_IN_SECONDS)
+def get_multiworld_sphere_tracker(tracker: UUID):
+    # Room must exist.
+    room = Room.get(tracker=tracker)
+    if not room:
+        abort(404)
+
+    tracker_data = TrackerData(room)
+    return render_generic_multiworld_sphere_tracker(tracker_data)
 
 
 # TODO: This is a temporary solution until a proper Tracker API can be implemented for tracker templates and data to
@@ -416,12 +494,12 @@ from worlds import network_data_package
 
 if "Factorio" in network_data_package["games"]:
     def render_Factorio_multiworld_tracker(tracker_data: TrackerData, enabled_trackers: List[str]):
-        inventories: Dict[TeamPlayer, Dict[int, int]] = {
-            (team, player): {
+        inventories: Dict[TeamPlayer, collections.Counter[str]] = {
+            (team, player): collections.Counter({
                 tracker_data.item_id_to_name["Factorio"][item_id]: count
                 for item_id, count in tracker_data.get_player_inventory_counts(team, player).items()
-            } for team, players in tracker_data.get_all_slots().items() for player in players
-            if tracker_data.get_player_game(team, player) == "Factorio"
+            }) for team, players in tracker_data.get_all_players().items() for player in players
+            if tracker_data.get_player_game(player) == "Factorio"
         }
 
         return render_template(
@@ -429,6 +507,7 @@ if "Factorio" in network_data_package["games"]:
             enabled_trackers=enabled_trackers,
             current_tracker="Factorio",
             room=tracker_data.room,
+            get_slot_info=tracker_data.get_slot_info,
             all_slots=tracker_data.get_all_slots(),
             room_players=tracker_data.get_all_players(),
             locations=tracker_data.get_room_locations(),
@@ -450,216 +529,118 @@ if "Factorio" in network_data_package["games"]:
     _multiworld_trackers["Factorio"] = render_Factorio_multiworld_tracker
 
 if "A Link to the Past" in network_data_package["games"]:
+    # Mapping from non-progressive item to progressive name and max level.
+    non_progressive_items = {
+        "Fighter Sword":  ("Progressive Sword",  1),
+        "Master Sword":   ("Progressive Sword",  2),
+        "Tempered Sword": ("Progressive Sword",  3),
+        "Golden Sword":   ("Progressive Sword",  4),
+        "Power Glove":    ("Progressive Glove",  1),
+        "Titans Mitts":   ("Progressive Glove",  2),
+        "Bow":            ("Progressive Bow",    1),
+        "Silver Bow":     ("Progressive Bow",    2),
+        "Blue Mail":      ("Progressive Mail",   1),
+        "Red Mail":       ("Progressive Mail",   2),
+        "Blue Shield":    ("Progressive Shield", 1),
+        "Red Shield":     ("Progressive Shield", 2),
+        "Mirror Shield":  ("Progressive Shield", 3),
+    }
+
+    progressive_item_max = {
+        "Progressive Sword":  4,
+        "Progressive Glove":  2,
+        "Progressive Bow":    2,
+        "Progressive Mail":   2,
+        "Progressive Shield": 3,
+    }
+
+    bottle_items = [
+        "Bottle",
+        "Bottle (Bee)",
+        "Bottle (Blue Potion)",
+        "Bottle (Fairy)",
+        "Bottle (Good Bee)",
+        "Bottle (Green Potion)",
+        "Bottle (Red Potion)",
+    ]
+
+    known_regions = [
+        "Light World", "Dark World", "Hyrule Castle", "Agahnims Tower", "Eastern Palace", "Desert Palace",
+        "Tower of Hera", "Palace of Darkness", "Swamp Palace", "Thieves Town", "Skull Woods", "Ice Palace",
+        "Misery Mire", "Turtle Rock", "Ganons Tower"
+    ]
+
+    class RegionCounts(NamedTuple):
+        total: int
+        checked: int
+
+    def prepare_inventories(team: int, player: int, inventory: Counter[str], tracker_data: TrackerData):
+        for item, (prog_item, level) in non_progressive_items.items():
+            if item in inventory:
+                inventory[prog_item] = min(max(inventory[prog_item], level), progressive_item_max[prog_item])
+
+        for bottle in bottle_items:
+            inventory["Bottles"] = min(inventory["Bottles"] + inventory[bottle], 4)
+
+        if "Progressive Bow (Alt)" in inventory:
+            inventory["Progressive Bow"] += inventory["Progressive Bow (Alt)"]
+            inventory["Progressive Bow"] = min(inventory["Progressive Bow"], progressive_item_max["Progressive Bow"])
+
+        # Highlight 'bombs' if we received any bomb upgrades in bombless start.
+        # In race mode, we'll just assume bombless start for simplicity.
+        if tracker_data.get_slot_data(player).get("bombless_start", True):
+            inventory["Bombs"] = sum(count for item, count in inventory.items() if item.startswith("Bomb Upgrade"))
+        else:
+            inventory["Bombs"] = 1
+
+        # Triforce item if we meet goal.
+        if tracker_data.get_room_client_statuses()[team, player] == ClientStatus.CLIENT_GOAL:
+            inventory["Triforce"] = 1
+
     def render_ALinkToThePast_multiworld_tracker(tracker_data: TrackerData, enabled_trackers: List[str]):
-        # Helper objects.
-        alttp_id_lookup = tracker_data.item_name_to_id["A Link to the Past"]
+        inventories: Dict[Tuple[int, int], Counter[str]] = {
+            (team, player): collections.Counter({
+                tracker_data.item_id_to_name["A Link to the Past"][code]: count
+                for code, count in tracker_data.get_player_inventory_counts(team, player).items()
+            })
+            for team, players in tracker_data.get_all_players().items()
+            for player in players if tracker_data.get_slot_info(player).game == "A Link to the Past"
+        }
 
-        multi_items = {
-            alttp_id_lookup[name]
-            for name in ("Progressive Sword", "Progressive Bow", "Bottle", "Progressive Glove", "Triforce Piece")
-        }
-        links = {
-            "Bow":                   "Progressive Bow",
-            "Silver Arrows":         "Progressive Bow",
-            "Silver Bow":            "Progressive Bow",
-            "Progressive Bow (Alt)": "Progressive Bow",
-            "Bottle (Red Potion)":   "Bottle",
-            "Bottle (Green Potion)": "Bottle",
-            "Bottle (Blue Potion)":  "Bottle",
-            "Bottle (Fairy)":        "Bottle",
-            "Bottle (Bee)":          "Bottle",
-            "Bottle (Good Bee)":     "Bottle",
-            "Fighter Sword":         "Progressive Sword",
-            "Master Sword":          "Progressive Sword",
-            "Tempered Sword":        "Progressive Sword",
-            "Golden Sword":          "Progressive Sword",
-            "Power Glove":           "Progressive Glove",
-            "Titans Mitts":          "Progressive Glove",
-        }
-        links = {alttp_id_lookup[key]: alttp_id_lookup[value] for key, value in links.items()}
-        levels = {
-            "Fighter Sword":   1,
-            "Master Sword":    2,
-            "Tempered Sword":  3,
-            "Golden Sword":    4,
-            "Power Glove":     1,
-            "Titans Mitts":    2,
-            "Bow":             1,
-            "Silver Bow":      2,
-            "Triforce Piece": 90,
-        }
-        tracking_names = [
-            "Progressive Sword", "Progressive Bow", "Book of Mudora", "Hammer", "Hookshot", "Magic Mirror", "Flute",
-            "Pegasus Boots", "Progressive Glove", "Flippers", "Moon Pearl", "Blue Boomerang", "Red Boomerang",
-            "Bug Catching Net", "Cape", "Shovel", "Lamp", "Mushroom", "Magic Powder", "Cane of Somaria",
-            "Cane of Byrna", "Fire Rod", "Ice Rod", "Bombos", "Ether", "Quake", "Bottle", "Triforce Piece", "Triforce",
-        ]
-        default_locations = {
-            "Light World": {
-                1572864, 1572865, 60034, 1572867, 1572868, 60037, 1572869, 1572866, 60040, 59788, 60046, 60175,
-                1572880, 60049, 60178, 1572883, 60052, 60181, 1572885, 60055, 60184, 191256, 60058, 60187, 1572884,
-                1572886, 1572887, 1572906, 60202, 60205, 59824, 166320, 1010170, 60208, 60211, 60214, 60217, 59836,
-                60220, 60223, 59839, 1573184, 60226, 975299, 1573188, 1573189, 188229, 60229, 60232, 1573193,
-                1573194, 60235, 1573187, 59845, 59854, 211407, 60238, 59857, 1573185, 1573186, 1572882, 212328,
-                59881, 59761, 59890, 59770, 193020, 212605
-            },
-            "Dark World": {
-                59776, 59779, 975237, 1572870, 60043, 1572881, 60190, 60193, 60196, 60199, 60840, 1573190, 209095,
-                1573192, 1573191, 60241, 60244, 60247, 60250, 59884, 59887, 60019, 60022, 60028, 60031
-            },
-            "Desert Palace": {1573216, 59842, 59851, 59791, 1573201, 59830},
-            "Eastern Palace": {1573200, 59827, 59893, 59767, 59833, 59773},
-            "Hyrule Castle": {60256, 60259, 60169, 60172, 59758, 59764, 60025, 60253},
-            "Agahnims Tower": {60082, 60085},
-            "Tower of Hera": {1573218, 59878, 59821, 1573202, 59896, 59899},
-            "Swamp Palace": {60064, 60067, 60070, 59782, 59785, 60073, 60076, 60079, 1573204, 60061},
-            "Thieves Town": {59905, 59908, 59911, 59914, 59917, 59920, 59923, 1573206},
-            "Skull Woods": {59809, 59902, 59848, 59794, 1573205, 59800, 59803, 59806},
-            "Ice Palace": {59872, 59875, 59812, 59818, 59860, 59797, 1573207, 59869},
-            "Misery Mire": {60001, 60004, 60007, 60010, 60013, 1573208, 59866, 59998},
-            "Turtle Rock": {59938, 59941, 59944, 1573209, 59947, 59950, 59953, 59956, 59926, 59929, 59932, 59935},
-            "Palace of Darkness": {
-                59968, 59971, 59974, 59977, 59980, 59983, 59986, 1573203, 59989, 59959, 59992, 59962, 59995,
-                59965
-            },
-            "Ganons Tower": {
-                60160, 60163, 60166, 60088, 60091, 60094, 60097, 60100, 60103, 60106, 60109, 60112, 60115, 60118,
-                60121, 60124, 60127, 1573217, 60130, 60133, 60136, 60139, 60142, 60145, 60148, 60151, 60157
-            },
-            "Total": set()
-        }
-        key_only_locations = {
-            "Light World": set(),
-            "Dark World": set(),
-            "Desert Palace": {0x140031, 0x14002b, 0x140061, 0x140028},
-            "Eastern Palace": {0x14005b, 0x140049},
-            "Hyrule Castle": {0x140037, 0x140034, 0x14000d, 0x14003d},
-            "Agahnims Tower": {0x140061, 0x140052},
-            "Tower of Hera": set(),
-            "Swamp Palace": {0x140019, 0x140016, 0x140013, 0x140010, 0x14000a},
-            "Thieves Town": {0x14005e, 0x14004f},
-            "Skull Woods": {0x14002e, 0x14001c},
-            "Ice Palace": {0x140004, 0x140022, 0x140025, 0x140046},
-            "Misery Mire": {0x140055, 0x14004c, 0x140064},
-            "Turtle Rock": {0x140058, 0x140007},
-            "Palace of Darkness": set(),
-            "Ganons Tower": {0x140040, 0x140043, 0x14003a, 0x14001f},
-            "Total": set()
-        }
-        location_to_area = {}
-        for area, locations in default_locations.items():
-            for location in locations:
-                location_to_area[location] = area
-        for area, locations in key_only_locations.items():
-            for location in locations:
-                location_to_area[location] = area
+        # Translate non-progression items to progression items for tracker simplicity.
+        for (team, player), inventory in inventories.items():
+            prepare_inventories(team, player, inventory, tracker_data)
 
-        checks_in_area = {area: len(checks) for area, checks in default_locations.items()}
-        checks_in_area["Total"] = 216
-        ordered_areas = (
-            "Light World", "Dark World", "Hyrule Castle", "Agahnims Tower", "Eastern Palace", "Desert Palace",
-            "Tower of Hera", "Palace of Darkness", "Swamp Palace", "Skull Woods", "Thieves Town", "Ice Palace",
-            "Misery Mire", "Turtle Rock", "Ganons Tower", "Total"
-        )
-
-        player_checks_in_area = {
+        regions: Dict[Tuple[int, int], Dict[str, RegionCounts]] = {
             (team, player): {
-                area_name: len(tracker_data._multidata["checks_in_area"][player][area_name])
-                if area_name != "Total" else tracker_data._multidata["checks_in_area"][player]["Total"]
-                for area_name in ordered_areas
+                region_name: RegionCounts(
+                    total=len(tracker_data._multidata["checks_in_area"][player][region_name]),
+                    checked=sum(
+                        1 for location in tracker_data._multidata["checks_in_area"][player][region_name]
+                        if location in tracker_data.get_player_checked_locations(team, player)
+                    ),
+                )
+                for region_name in known_regions
             }
-            for team, players in tracker_data.get_all_slots().items()
-            for player in players
-            if tracker_data.get_slot_info(team, player).type != SlotType.group and
-            tracker_data.get_slot_info(team, player).game == "A Link to the Past"
+            for team, players in tracker_data.get_all_players().items()
+            for player in players if tracker_data.get_slot_info(player).game == "A Link to the Past"
         }
 
-        tracking_ids = []
-        for item in tracking_names:
-            tracking_ids.append(alttp_id_lookup[item])
-
-        # Can't wait to get this into the apworld. Oof.
-        from worlds.alttp import Items
-
-        small_key_ids = {}
-        big_key_ids = {}
-        ids_small_key = {}
-        ids_big_key = {}
-        for item_name, data in Items.item_table.items():
-            if "Key" in item_name:
-                area = item_name.split("(")[1][:-1]
-                if "Small" in item_name:
-                    small_key_ids[area] = data[2]
-                    ids_small_key[data[2]] = area
-                else:
-                    big_key_ids[area] = data[2]
-                    ids_big_key[data[2]] = area
-
-        def _get_location_table(checks_table: dict) -> dict:
-            loc_to_area = {}
-            for area, locations in checks_table.items():
-                if area == "Total":
-                    continue
-                for location in locations:
-                    loc_to_area[location] = area
-            return loc_to_area
-
-        player_location_to_area = {
-            (team, player): _get_location_table(tracker_data._multidata["checks_in_area"][player])
-            for team, players in tracker_data.get_all_slots().items()
-            for player in players
-            if tracker_data.get_slot_info(team, player).type != SlotType.group and
-            tracker_data.get_slot_info(team, player).game == "A Link to the Past"
-        }
-
-        checks_done: Dict[TeamPlayer, Dict[str: int]] = {
-            (team, player): {location_name: 0 for location_name in default_locations}
-            for team, players in tracker_data.get_all_slots().items()
-            for player in players
-            if tracker_data.get_slot_info(team, player).type != SlotType.group and
-            tracker_data.get_slot_info(team, player).game == "A Link to the Past"
-        }
-
-        inventories: Dict[TeamPlayer, Dict[int, int]] = {}
-        player_big_key_locations = {(player): set() for player in tracker_data.get_all_slots()[0]}
-        player_small_key_locations = {player: set() for player in tracker_data.get_all_slots()[0]}
-        group_big_key_locations = set()
-        group_key_locations = set()
-
-        for (team, player), locations in checks_done.items():
-            # Check if game complete.
-            if tracker_data.get_player_client_status(team, player) == ClientStatus.CLIENT_GOAL:
-                inventories[team, player][106] = 1  # Triforce
-
-            # Count number of locations checked.
-            for location in tracker_data.get_player_checked_locations(team, player):
-                checks_done[team, player][player_location_to_area[team, player][location]] += 1
-                checks_done[team, player]["Total"] += 1
-
-            # Count keys.
-            for location, (item, receiving, _) in tracker_data.get_player_locations(team, player).items():
-                if item in ids_big_key:
-                    player_big_key_locations[receiving].add(ids_big_key[item])
-                elif item in ids_small_key:
-                    player_small_key_locations[receiving].add(ids_small_key[item])
-
-            # Iterate over received items and build inventory/key counts.
-            inventories[team, player] = collections.Counter()
-            for network_item in tracker_data.get_player_received_items(team, player):
-                target_item = links.get(network_item.item, network_item.item)
-                if network_item.item in levels:  # non-progressive
-                    inventories[team, player][target_item] = (max(inventories[team, player][target_item], levels[network_item.item]))
-                else:
-                    inventories[team, player][target_item] += 1
-
-            group_key_locations |= player_small_key_locations[player]
-            group_big_key_locations |= player_big_key_locations[player]
+        # Get a totals count.
+        for player, player_regions in regions.items():
+            total = 0
+            checked = 0
+            for region, region_counts in player_regions.items():
+                total += region_counts.total
+                checked += region_counts.checked
+            regions[player]["Total"] = RegionCounts(total, checked)
 
         return render_template(
             "multitracker__ALinkToThePast.html",
             enabled_trackers=enabled_trackers,
             current_tracker="A Link to the Past",
             room=tracker_data.room,
+            get_slot_info=tracker_data.get_slot_info,
             all_slots=tracker_data.get_all_slots(),
             room_players=tracker_data.get_all_players(),
             locations=tracker_data.get_room_locations(),
@@ -676,209 +657,39 @@ if "A Link to the Past" in network_data_package["games"]:
             item_id_to_name=tracker_data.item_id_to_name,
             location_id_to_name=tracker_data.location_id_to_name,
             inventories=inventories,
-            tracking_names=tracking_names,
-            tracking_ids=tracking_ids,
-            multi_items=multi_items,
-            checks_done=checks_done,
-            ordered_areas=ordered_areas,
-            checks_in_area=player_checks_in_area,
-            key_locations=group_key_locations,
-            big_key_locations=group_big_key_locations,
-            small_key_ids=small_key_ids,
-            big_key_ids=big_key_ids,
+            regions=regions,
+            known_regions=known_regions,
         )
 
     def render_ALinkToThePast_tracker(tracker_data: TrackerData, team: int, player: int) -> str:
-        # Helper objects.
-        alttp_id_lookup = tracker_data.item_name_to_id["A Link to the Past"]
+        inventory = collections.Counter({
+            tracker_data.item_id_to_name["A Link to the Past"][code]: count
+            for code, count in tracker_data.get_player_inventory_counts(team, player).items()
+        })
 
-        links = {
-            "Bow":                   "Progressive Bow",
-            "Silver Arrows":         "Progressive Bow",
-            "Silver Bow":            "Progressive Bow",
-            "Progressive Bow (Alt)": "Progressive Bow",
-            "Bottle (Red Potion)":   "Bottle",
-            "Bottle (Green Potion)": "Bottle",
-            "Bottle (Blue Potion)":  "Bottle",
-            "Bottle (Fairy)":        "Bottle",
-            "Bottle (Bee)":          "Bottle",
-            "Bottle (Good Bee)":     "Bottle",
-            "Fighter Sword":         "Progressive Sword",
-            "Master Sword":          "Progressive Sword",
-            "Tempered Sword":        "Progressive Sword",
-            "Golden Sword":          "Progressive Sword",
-            "Power Glove":           "Progressive Glove",
-            "Titans Mitts":          "Progressive Glove",
-        }
-        links = {alttp_id_lookup[key]: alttp_id_lookup[value] for key, value in links.items()}
-        levels = {
-            "Fighter Sword":   1,
-            "Master Sword":    2,
-            "Tempered Sword":  3,
-            "Golden Sword":    4,
-            "Power Glove":     1,
-            "Titans Mitts":    2,
-            "Bow":             1,
-            "Silver Bow":      2,
-            "Triforce Piece": 90,
-        }
-        tracking_names = [
-            "Progressive Sword", "Progressive Bow", "Book of Mudora", "Hammer", "Hookshot", "Magic Mirror", "Flute",
-            "Pegasus Boots", "Progressive Glove", "Flippers", "Moon Pearl", "Blue Boomerang", "Red Boomerang",
-            "Bug Catching Net", "Cape", "Shovel", "Lamp", "Mushroom", "Magic Powder", "Cane of Somaria",
-            "Cane of Byrna", "Fire Rod", "Ice Rod", "Bombos", "Ether", "Quake", "Bottle", "Triforce Piece", "Triforce",
-        ]
-        default_locations = {
-            "Light World": {
-                1572864, 1572865, 60034, 1572867, 1572868, 60037, 1572869, 1572866, 60040, 59788, 60046, 60175,
-                1572880, 60049, 60178, 1572883, 60052, 60181, 1572885, 60055, 60184, 191256, 60058, 60187, 1572884,
-                1572886, 1572887, 1572906, 60202, 60205, 59824, 166320, 1010170, 60208, 60211, 60214, 60217, 59836,
-                60220, 60223, 59839, 1573184, 60226, 975299, 1573188, 1573189, 188229, 60229, 60232, 1573193,
-                1573194, 60235, 1573187, 59845, 59854, 211407, 60238, 59857, 1573185, 1573186, 1572882, 212328,
-                59881, 59761, 59890, 59770, 193020, 212605
-            },
-            "Dark World": {
-                59776, 59779, 975237, 1572870, 60043, 1572881, 60190, 60193, 60196, 60199, 60840, 1573190, 209095,
-                1573192, 1573191, 60241, 60244, 60247, 60250, 59884, 59887, 60019, 60022, 60028, 60031
-            },
-            "Desert Palace": {1573216, 59842, 59851, 59791, 1573201, 59830},
-            "Eastern Palace": {1573200, 59827, 59893, 59767, 59833, 59773},
-            "Hyrule Castle": {60256, 60259, 60169, 60172, 59758, 59764, 60025, 60253},
-            "Agahnims Tower": {60082, 60085},
-            "Tower of Hera": {1573218, 59878, 59821, 1573202, 59896, 59899},
-            "Swamp Palace": {60064, 60067, 60070, 59782, 59785, 60073, 60076, 60079, 1573204, 60061},
-            "Thieves Town": {59905, 59908, 59911, 59914, 59917, 59920, 59923, 1573206},
-            "Skull Woods": {59809, 59902, 59848, 59794, 1573205, 59800, 59803, 59806},
-            "Ice Palace": {59872, 59875, 59812, 59818, 59860, 59797, 1573207, 59869},
-            "Misery Mire": {60001, 60004, 60007, 60010, 60013, 1573208, 59866, 59998},
-            "Turtle Rock": {59938, 59941, 59944, 1573209, 59947, 59950, 59953, 59956, 59926, 59929, 59932, 59935},
-            "Palace of Darkness": {
-                59968, 59971, 59974, 59977, 59980, 59983, 59986, 1573203, 59989, 59959, 59992, 59962, 59995,
-                59965
-            },
-            "Ganons Tower": {
-                60160, 60163, 60166, 60088, 60091, 60094, 60097, 60100, 60103, 60106, 60109, 60112, 60115, 60118,
-                60121, 60124, 60127, 1573217, 60130, 60133, 60136, 60139, 60142, 60145, 60148, 60151, 60157
-            },
-            "Total": set()
-        }
-        key_only_locations = {
-            "Light World": set(),
-            "Dark World": set(),
-            "Desert Palace": {0x140031, 0x14002b, 0x140061, 0x140028},
-            "Eastern Palace": {0x14005b, 0x140049},
-            "Hyrule Castle": {0x140037, 0x140034, 0x14000d, 0x14003d},
-            "Agahnims Tower": {0x140061, 0x140052},
-            "Tower of Hera": set(),
-            "Swamp Palace": {0x140019, 0x140016, 0x140013, 0x140010, 0x14000a},
-            "Thieves Town": {0x14005e, 0x14004f},
-            "Skull Woods": {0x14002e, 0x14001c},
-            "Ice Palace": {0x140004, 0x140022, 0x140025, 0x140046},
-            "Misery Mire": {0x140055, 0x14004c, 0x140064},
-            "Turtle Rock": {0x140058, 0x140007},
-            "Palace of Darkness": set(),
-            "Ganons Tower": {0x140040, 0x140043, 0x14003a, 0x14001f},
-            "Total": set()
-        }
-        location_to_area = {}
-        for area, locations in default_locations.items():
-            for checked_location in locations:
-                location_to_area[checked_location] = area
-        for area, locations in key_only_locations.items():
-            for checked_location in locations:
-                location_to_area[checked_location] = area
+        # Translate non-progression items to progression items for tracker simplicity.
+        prepare_inventories(team, player, inventory, tracker_data)
 
-        checks_in_area = {area: len(checks) for area, checks in default_locations.items()}
-        checks_in_area["Total"] = 216
-        ordered_areas = (
-            "Light World", "Dark World", "Hyrule Castle", "Agahnims Tower", "Eastern Palace", "Desert Palace",
-            "Tower of Hera", "Palace of Darkness", "Swamp Palace", "Skull Woods", "Thieves Town", "Ice Palace",
-            "Misery Mire", "Turtle Rock", "Ganons Tower", "Total"
-        )
-
-        tracking_ids = []
-        for item in tracking_names:
-            tracking_ids.append(alttp_id_lookup[item])
-
-        # Can't wait to get this into the apworld. Oof.
-        from worlds.alttp import Items
-
-        small_key_ids = {}
-        big_key_ids = {}
-        ids_small_key = {}
-        ids_big_key = {}
-        for item_name, data in Items.item_table.items():
-            if "Key" in item_name:
-                area = item_name.split("(")[1][:-1]
-                if "Small" in item_name:
-                    small_key_ids[area] = data[2]
-                    ids_small_key[data[2]] = area
-                else:
-                    big_key_ids[area] = data[2]
-                    ids_big_key[data[2]] = area
-
-        inventory = collections.Counter()
-        checks_done = {loc_name: 0 for loc_name in default_locations}
-        player_big_key_locations = set()
-        player_small_key_locations = set()
-
-        player_locations = tracker_data.get_player_locations(team, player)
-        for checked_location in tracker_data.get_player_checked_locations(team, player):
-            if checked_location in player_locations:
-                area_name = location_to_area.get(checked_location, None)
-                if area_name:
-                    checks_done[area_name] += 1
-
-                checks_done["Total"] += 1
-
-        for received_item in tracker_data.get_player_received_items(team, player):
-            target_item = links.get(received_item.item, received_item.item)
-            if received_item.item in levels:  # non-progressive
-                inventory[target_item] = max(inventory[target_item], levels[received_item.item])
-            else:
-                inventory[target_item] += 1
-
-        for location, (item_id, _, _) in player_locations.items():
-            if item_id in ids_big_key:
-                player_big_key_locations.add(ids_big_key[item_id])
-            elif item_id in ids_small_key:
-                player_small_key_locations.add(ids_small_key[item_id])
-
-        # Note the presence of the triforce item
-        if tracker_data.get_player_client_status(team, player) == ClientStatus.CLIENT_GOAL:
-            inventory[106] = 1  # Triforce
-
-        # Progressive items need special handling for icons and class
-        progressive_items = {
-            "Progressive Sword":  94,
-            "Progressive Glove":  97,
-            "Progressive Bow":    100,
-            "Progressive Mail":   96,
-            "Progressive Shield": 95,
-        }
-        progressive_names = {
-            "Progressive Sword":  [None, "Fighter Sword", "Master Sword", "Tempered Sword", "Golden Sword"],
-            "Progressive Glove":  [None, "Power Glove", "Titan Mitts"],
-            "Progressive Bow":    [None, "Bow", "Silver Bow"],
-            "Progressive Mail":   ["Green Mail", "Blue Mail", "Red Mail"],
-            "Progressive Shield": [None, "Blue Shield", "Red Shield", "Mirror Shield"]
+        regions = {
+            region_name: {
+                "checked": sum(
+                    1 for location in tracker_data._multidata["checks_in_area"][player][region_name]
+                    if location in tracker_data.get_player_checked_locations(team, player)
+                ),
+                "locations": [
+                    (
+                        tracker_data.location_id_to_name["A Link to the Past"][location],
+                        location in tracker_data.get_player_checked_locations(team, player)
+                    )
+                    for location in tracker_data._multidata["checks_in_area"][player][region_name]
+                ],
+            }
+            for region_name in known_regions
         }
 
-        # Determine which icon to use
-        display_data = {}
-        for item_name, item_id in progressive_items.items():
-            level = min(inventory[item_id], len(progressive_names[item_name]) - 1)
-            display_name = progressive_names[item_name][level]
-            acquired = True
-            if not display_name:
-                acquired = False
-                display_name = progressive_names[item_name][level + 1]
-            base_name = item_name.split(maxsplit=1)[1].lower()
-            display_data[base_name + "_acquired"] = acquired
-            display_data[base_name + "_icon"] = display_name
-
-        # The single player tracker doesn't care about overworld, underworld, and total checks. Maybe it should?
-        sp_areas = ordered_areas[2:15]
+        # Sort locations in regions by name
+        for region in regions:
+            regions[region]["locations"].sort()
 
         return render_template(
             template_name_or_list="tracker__ALinkToThePast.html",
@@ -886,141 +697,13 @@ if "A Link to the Past" in network_data_package["games"]:
             team=team,
             player=player,
             inventory=inventory,
-            player_name=tracker_data.get_player_name(team, player),
-            checks_done=checks_done,
-            checks_in_area=checks_in_area,
-            acquired_items={tracker_data.item_id_to_name["A Link to the Past"][id] for id in inventory},
-            sp_areas=sp_areas,
-            small_key_ids=small_key_ids,
-            key_locations=player_small_key_locations,
-            big_key_ids=big_key_ids,
-            big_key_locations=player_big_key_locations,
-            **display_data,
+            player_name=tracker_data.get_player_name(player),
+            regions=regions,
+            known_regions=known_regions,
         )
 
     _multiworld_trackers["A Link to the Past"] = render_ALinkToThePast_multiworld_tracker
     _player_trackers["A Link to the Past"] = render_ALinkToThePast_tracker
-
-if "Minecraft" in network_data_package["games"]:
-    def render_Minecraft_tracker(tracker_data: TrackerData, team: int, player: int) -> str:
-        icons = {
-            "Wooden Pickaxe":     "https://static.wikia.nocookie.net/minecraft_gamepedia/images/d/d2/Wooden_Pickaxe_JE3_BE3.png",
-            "Stone Pickaxe":      "https://static.wikia.nocookie.net/minecraft_gamepedia/images/c/c4/Stone_Pickaxe_JE2_BE2.png",
-            "Iron Pickaxe":       "https://static.wikia.nocookie.net/minecraft_gamepedia/images/d/d1/Iron_Pickaxe_JE3_BE2.png",
-            "Diamond Pickaxe":    "https://static.wikia.nocookie.net/minecraft_gamepedia/images/e/e7/Diamond_Pickaxe_JE3_BE3.png",
-            "Wooden Sword":       "https://static.wikia.nocookie.net/minecraft_gamepedia/images/d/d5/Wooden_Sword_JE2_BE2.png",
-            "Stone Sword":        "https://static.wikia.nocookie.net/minecraft_gamepedia/images/b/b1/Stone_Sword_JE2_BE2.png",
-            "Iron Sword":         "https://static.wikia.nocookie.net/minecraft_gamepedia/images/8/8e/Iron_Sword_JE2_BE2.png",
-            "Diamond Sword":      "https://static.wikia.nocookie.net/minecraft_gamepedia/images/4/44/Diamond_Sword_JE3_BE3.png",
-            "Leather Tunic":      "https://static.wikia.nocookie.net/minecraft_gamepedia/images/b/b7/Leather_Tunic_JE4_BE2.png",
-            "Iron Chestplate":    "https://static.wikia.nocookie.net/minecraft_gamepedia/images/3/31/Iron_Chestplate_JE2_BE2.png",
-            "Diamond Chestplate": "https://static.wikia.nocookie.net/minecraft_gamepedia/images/e/e0/Diamond_Chestplate_JE3_BE2.png",
-            "Iron Ingot":         "https://static.wikia.nocookie.net/minecraft_gamepedia/images/f/fc/Iron_Ingot_JE3_BE2.png",
-            "Block of Iron":      "https://static.wikia.nocookie.net/minecraft_gamepedia/images/7/7e/Block_of_Iron_JE4_BE3.png",
-            "Brewing Stand":      "https://static.wikia.nocookie.net/minecraft_gamepedia/images/b/b3/Brewing_Stand_%28empty%29_JE10.png",
-            "Ender Pearl":        "https://static.wikia.nocookie.net/minecraft_gamepedia/images/f/f6/Ender_Pearl_JE3_BE2.png",
-            "Bucket":             "https://static.wikia.nocookie.net/minecraft_gamepedia/images/f/fc/Bucket_JE2_BE2.png",
-            "Bow":                "https://static.wikia.nocookie.net/minecraft_gamepedia/images/a/ab/Bow_%28Pull_2%29_JE1_BE1.png",
-            "Shield":             "https://static.wikia.nocookie.net/minecraft_gamepedia/images/c/c6/Shield_JE2_BE1.png",
-            "Red Bed":            "https://static.wikia.nocookie.net/minecraft_gamepedia/images/6/6a/Red_Bed_%28N%29.png",
-            "Netherite Scrap":    "https://static.wikia.nocookie.net/minecraft_gamepedia/images/3/33/Netherite_Scrap_JE2_BE1.png",
-            "Flint and Steel":    "https://static.wikia.nocookie.net/minecraft_gamepedia/images/9/94/Flint_and_Steel_JE4_BE2.png",
-            "Enchanting Table":   "https://static.wikia.nocookie.net/minecraft_gamepedia/images/3/31/Enchanting_Table.gif",
-            "Fishing Rod":        "https://static.wikia.nocookie.net/minecraft_gamepedia/images/7/7f/Fishing_Rod_JE2_BE2.png",
-            "Campfire":           "https://static.wikia.nocookie.net/minecraft_gamepedia/images/9/91/Campfire_JE2_BE2.gif",
-            "Water Bottle":       "https://static.wikia.nocookie.net/minecraft_gamepedia/images/7/75/Water_Bottle_JE2_BE2.png",
-            "Spyglass":           "https://static.wikia.nocookie.net/minecraft_gamepedia/images/c/c1/Spyglass_JE2_BE1.png",
-            "Dragon Egg Shard":   "https://static.wikia.nocookie.net/minecraft_gamepedia/images/3/38/Dragon_Egg_JE4.png",
-            "Lead":               "https://static.wikia.nocookie.net/minecraft_gamepedia/images/1/1f/Lead_JE2_BE2.png",
-            "Saddle":             "https://i.imgur.com/2QtDyR0.png",
-            "Channeling Book":    "https://i.imgur.com/J3WsYZw.png",
-            "Silk Touch Book":    "https://i.imgur.com/iqERxHQ.png",
-            "Piercing IV Book":   "https://i.imgur.com/OzJptGz.png",
-        }
-
-        minecraft_location_ids = {
-            "Story":       [42073, 42023, 42027, 42039, 42002, 42009, 42010, 42070,
-                            42041, 42049, 42004, 42031, 42025, 42029, 42051, 42077],
-            "Nether":      [42017, 42044, 42069, 42058, 42034, 42060, 42066, 42076, 42064, 42071, 42021,
-                            42062, 42008, 42061, 42033, 42011, 42006, 42019, 42000, 42040, 42001, 42015, 42104, 42014],
-            "The End":     [42052, 42005, 42012, 42032, 42030, 42042, 42018, 42038, 42046],
-            "Adventure":   [42047, 42050, 42096, 42097, 42098, 42059, 42055, 42072, 42003, 42109, 42035, 42016, 42020,
-                            42048, 42054, 42068, 42043, 42106, 42074, 42075, 42024, 42026, 42037, 42045, 42056, 42105,
-                            42099, 42103, 42110, 42100],
-            "Husbandry":   [42065, 42067, 42078, 42022, 42113, 42107, 42007, 42079, 42013, 42028, 42036, 42108, 42111,
-                            42112,
-                            42057, 42063, 42053, 42102, 42101, 42092, 42093, 42094, 42095],
-            "Archipelago": [42080, 42081, 42082, 42083, 42084, 42085, 42086, 42087, 42088, 42089, 42090, 42091],
-        }
-
-        display_data = {}
-
-        # Determine display for progressive items
-        progressive_items = {
-            "Progressive Tools":             45013,
-            "Progressive Weapons":           45012,
-            "Progressive Armor":             45014,
-            "Progressive Resource Crafting": 45001
-        }
-        progressive_names = {
-            "Progressive Tools":             ["Wooden Pickaxe", "Stone Pickaxe", "Iron Pickaxe", "Diamond Pickaxe"],
-            "Progressive Weapons":           ["Wooden Sword", "Stone Sword", "Iron Sword", "Diamond Sword"],
-            "Progressive Armor":             ["Leather Tunic", "Iron Chestplate", "Diamond Chestplate"],
-            "Progressive Resource Crafting": ["Iron Ingot", "Iron Ingot", "Block of Iron"]
-        }
-
-        inventory = tracker_data.get_player_inventory_counts(team, player)
-        for item_name, item_id in progressive_items.items():
-            level = min(inventory[item_id], len(progressive_names[item_name]) - 1)
-            display_name = progressive_names[item_name][level]
-            base_name = item_name.split(maxsplit=1)[1].lower().replace(" ", "_")
-            display_data[base_name + "_url"] = icons[display_name]
-
-        # Multi-items
-        multi_items = {
-            "3 Ender Pearls":    45029,
-            "8 Netherite Scrap": 45015,
-            "Dragon Egg Shard":  45043
-        }
-        for item_name, item_id in multi_items.items():
-            base_name = item_name.split()[-1].lower()
-            count = inventory[item_id]
-            if count >= 0:
-                display_data[base_name + "_count"] = count
-
-        # Victory condition
-        game_state = tracker_data.get_player_client_status(team, player)
-        display_data["game_finished"] = game_state == 30
-
-        # Turn location IDs into advancement tab counts
-        checked_locations = tracker_data.get_player_checked_locations(team, player)
-        lookup_name = lambda id: tracker_data.location_id_to_name["Minecraft"][id]
-        location_info = {tab_name: {lookup_name(id): (id in checked_locations) for id in tab_locations}
-                         for tab_name, tab_locations in minecraft_location_ids.items()}
-        checks_done = {tab_name: len([id for id in tab_locations if id in checked_locations])
-                       for tab_name, tab_locations in minecraft_location_ids.items()}
-        checks_done["Total"] = len(checked_locations)
-        checks_in_area = {tab_name: len(tab_locations) for tab_name, tab_locations in minecraft_location_ids.items()}
-        checks_in_area["Total"] = sum(checks_in_area.values())
-
-        lookup_any_item_id_to_name = tracker_data.item_id_to_name["Minecraft"]
-        return render_template(
-            "tracker__Minecraft.html",
-            inventory=inventory,
-            icons=icons,
-            acquired_items={lookup_any_item_id_to_name[id] for id, count in inventory.items() if count > 0},
-            player=player,
-            team=team,
-            room=tracker_data.room,
-            player_name=tracker_data.get_player_name(team, player),
-            saving_second=tracker_data.get_room_saving_second(),
-            checks_done=checks_done,
-            checks_in_area=checks_in_area,
-            location_info=location_info,
-            **display_data,
-        )
-
-    _player_trackers["Minecraft"] = render_Minecraft_tracker
 
 if "Ocarina of Time" in network_data_package["games"]:
     def render_OcarinaOfTime_tracker(tracker_data: TrackerData, team: int, player: int) -> str:
@@ -1161,7 +844,7 @@ if "Ocarina of Time" in network_data_package["games"]:
                 return full_name[len(area):]
             return full_name
 
-        locations = tracker_data.get_player_locations(team, player)
+        locations = tracker_data.get_player_locations(player)
         checked_locations = tracker_data.get_player_checked_locations(team, player).intersection(set(locations))
         location_info = {}
         checks_done = {}
@@ -1223,7 +906,7 @@ if "Ocarina of Time" in network_data_package["games"]:
             player=player,
             team=team,
             room=tracker_data.room,
-            player_name=tracker_data.get_player_name(team, player),
+            player_name=tracker_data.get_player_name(player),
             icons=icons,
             acquired_items={lookup_any_item_id_to_name[id] for id, count in inventory.items() if count > 0},
             checks_done=checks_done, checks_in_area=checks_in_area, location_info=location_info,
@@ -1266,53 +949,41 @@ if "Timespinner" in network_data_package["games"]:
             "Plasma Orb":          "https://timespinnerwiki.com/mediawiki/images/4/44/Plasma_Orb.png",
             "Kobo":                "https://timespinnerwiki.com/mediawiki/images/c/c6/Familiar_Kobo.png",
             "Merchant Crow":       "https://timespinnerwiki.com/mediawiki/images/4/4e/Familiar_Crow.png",
+            "Laser Access":        "https://timespinnerwiki.com/mediawiki/images/9/99/Historical_Documents.png",
+            "Lab Glasses":         "https://timespinnerwiki.com/mediawiki/images/4/4a/Lab_Glasses.png",
+            "Eye Orb":             "https://timespinnerwiki.com/mediawiki/images/a/a4/Eye_Orb.png",
+            "Lab Coat":            "https://timespinnerwiki.com/mediawiki/images/5/51/Lab_Coat.png", 
+            "Demon":               "https://timespinnerwiki.com/mediawiki/images/f/f8/Familiar_Demon.png",
+            "Cube of Bodie":       "https://timespinnerwiki.com/mediawiki/images/1/14/Menu_Icon_Stats.png"
         }
 
         timespinner_location_ids = {
-            "Present":         [
-                1337000, 1337001, 1337002, 1337003, 1337004, 1337005, 1337006, 1337007, 1337008, 1337009,
-                1337010, 1337011, 1337012, 1337013, 1337014, 1337015, 1337016, 1337017, 1337018, 1337019,
-                1337020, 1337021, 1337022, 1337023, 1337024, 1337025, 1337026, 1337027, 1337028, 1337029,
-                1337030, 1337031, 1337032, 1337033, 1337034, 1337035, 1337036, 1337037, 1337038, 1337039,
-                1337040, 1337041, 1337042, 1337043, 1337044, 1337045, 1337046, 1337047, 1337048, 1337049,
-                1337050, 1337051, 1337052, 1337053, 1337054, 1337055, 1337056, 1337057, 1337058, 1337059,
-                1337060, 1337061, 1337062, 1337063, 1337064, 1337065, 1337066, 1337067, 1337068, 1337069,
-                1337070, 1337071, 1337072, 1337073, 1337074, 1337075, 1337076, 1337077, 1337078, 1337079,
-                1337080, 1337081, 1337082, 1337083, 1337084, 1337085],
-            "Past":            [
-                1337086, 1337087, 1337088, 1337089,
-                1337090, 1337091, 1337092, 1337093, 1337094, 1337095, 1337096, 1337097, 1337098, 1337099,
-                1337100, 1337101, 1337102, 1337103, 1337104, 1337105, 1337106, 1337107, 1337108, 1337109,
-                1337110, 1337111, 1337112, 1337113, 1337114, 1337115, 1337116, 1337117, 1337118, 1337119,
-                1337120, 1337121, 1337122, 1337123, 1337124, 1337125, 1337126, 1337127, 1337128, 1337129,
-                1337130, 1337131, 1337132, 1337133, 1337134, 1337135, 1337136, 1337137, 1337138, 1337139,
-                1337140, 1337141, 1337142, 1337143, 1337144, 1337145, 1337146, 1337147, 1337148, 1337149,
-                1337150, 1337151, 1337152, 1337153, 1337154, 1337155,
-                1337171, 1337172, 1337173, 1337174, 1337175],
+            "Present": list(range(1337000, 1337085)),
+            "Past": list(range(1337086, 1337157)) + list(range(1337159, 1337175)),
             "Ancient Pyramid": [
                 1337236,
                 1337246, 1337247, 1337248, 1337249]
         }
 
-        slot_data = tracker_data.get_slot_data(team, player)
+        slot_data = tracker_data.get_slot_data(player)
         if (slot_data["DownloadableItems"]):
-            timespinner_location_ids["Present"] += [
-                1337156, 1337157, 1337159,
-                1337160, 1337161, 1337162, 1337163, 1337164, 1337165, 1337166, 1337167, 1337168, 1337169,
-                1337170]
+            timespinner_location_ids["Present"] += [1337156, 1337157] + list(range(1337159, 1337170))
         if (slot_data["Cantoran"]):
             timespinner_location_ids["Past"].append(1337176)
         if (slot_data["LoreChecks"]):
-            timespinner_location_ids["Present"] += [
-                1337177, 1337178, 1337179,
-                1337180, 1337181, 1337182, 1337183, 1337184, 1337185, 1337186, 1337187]
-            timespinner_location_ids["Past"] += [
-                1337188, 1337189,
-                1337190, 1337191, 1337192, 1337193, 1337194, 1337195, 1337196, 1337197, 1337198]
+            timespinner_location_ids["Present"] += list(range(1337177, 1337187))
+            timespinner_location_ids["Past"] += list(range(1337188, 1337198))
         if (slot_data["GyreArchives"]):
+            timespinner_location_ids["Ancient Pyramid"] += list(range(1337237, 1337245))
+        if (slot_data["PyramidStart"]):
             timespinner_location_ids["Ancient Pyramid"] += [
-                1337237, 1337238, 1337239,
-                1337240, 1337241, 1337242, 1337243, 1337244, 1337245]
+                1337233, 1337234, 1337235]
+        if (slot_data["PureTorcher"]):
+            timespinner_location_ids["Present"] += list(range(1337250, 1337352)) + list(range(1337422, 1337496)) + [1337506] + list(range(1337712, 1337779)) + [1337781, 1337782]
+            timespinner_location_ids["Past"] += list(range(1337497, 1337505)) + list(range(1337507, 1337711)) + [1337780]
+            timespinner_location_ids["Ancient Pyramid"] += list(range(1337369, 1337421))
+            if (slot_data["GyreArchives"]):
+                timespinner_location_ids["Ancient Pyramid"] += list(range(1337353, 1337368))
 
         display_data = {}
 
@@ -1343,7 +1014,7 @@ if "Timespinner" in network_data_package["games"]:
             player=player,
             team=team,
             room=tracker_data.room,
-            player_name=tracker_data.get_player_name(team, player),
+            player_name=tracker_data.get_player_name(player),
             checks_done=checks_done,
             checks_in_area=checks_in_area,
             location_info=location_info,
@@ -1452,7 +1123,7 @@ if "Super Metroid" in network_data_package["games"]:
             player=player,
             team=team,
             room=tracker_data.room,
-            player_name=tracker_data.get_player_name(team, player),
+            player_name=tracker_data.get_player_name(player),
             checks_done=checks_done,
             checks_in_area=checks_in_area,
             location_info=location_info,
@@ -1502,7 +1173,7 @@ if "ChecksFinder" in network_data_package["games"]:
 
         display_data = {}
         inventory = tracker_data.get_player_inventory_counts(team, player)
-        locations = tracker_data.get_player_locations(team, player)
+        locations = tracker_data.get_player_locations(player)
 
         # Multi-items
         multi_items = {
@@ -1544,7 +1215,7 @@ if "ChecksFinder" in network_data_package["games"]:
             player=player,
             team=team,
             room=tracker_data.room,
-            player_name=tracker_data.get_player_name(team, player),
+            player_name=tracker_data.get_player_name(player),
             checks_done=checks_done,
             checks_in_area=checks_in_area,
             location_info=location_info,
@@ -1553,430 +1224,227 @@ if "ChecksFinder" in network_data_package["games"]:
 
     _player_trackers["ChecksFinder"] = render_ChecksFinder_tracker
 
-if "Starcraft 2 Wings of Liberty" in network_data_package["games"]:
-    def render_Starcraft2WingsOfLiberty_tracker(tracker_data: TrackerData, team: int, player: int) -> str:
-        SC2WOL_LOC_ID_OFFSET = 1000
+if "Starcraft 2" in network_data_package["games"]:
+    def render_Starcraft2_tracker(tracker_data: TrackerData, team: int, player: int) -> str:
         SC2WOL_ITEM_ID_OFFSET = 1000
+        SC2HOTS_ITEM_ID_OFFSET = 2000
+        SC2LOTV_ITEM_ID_OFFSET = 3000
+        SC2_KEY_ITEM_ID_OFFSET = 4000
+        NCO_LOCATION_ID_LOW = 20004500
+        NCO_LOCATION_ID_HIGH = NCO_LOCATION_ID_LOW + 1000
 
-        icons = {
-            "Starting Minerals":                           "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/icons/icon-mineral-protoss.png",
-            "Starting Vespene":                            "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/icons/icon-gas-terran.png",
-            "Starting Supply":                             "https://static.wikia.nocookie.net/starcraft/images/d/d3/TerranSupply_SC2_Icon1.gif",
+        STARTING_MINERALS_ITEM_ID = 1800
+        STARTING_VESPENE_ITEM_ID = 1801
+        STARTING_SUPPLY_ITEM_ID = 1802
+        # NOTHING_ITEM_ID = 1803
+        MAX_SUPPLY_ITEM_ID = 1804
+        SHIELD_REGENERATION_ITEM_ID = 1805
+        BUILDING_CONSTRUCTION_SPEED_ITEM_ID = 1806
+        UPGRADE_RESEARCH_SPEED_ITEM_ID = 1807
+        UPGRADE_RESEARCH_COST_ITEM_ID = 1808
+        REDUCED_MAX_SUPPLY_ITEM_ID = 1850
+        slot_data = tracker_data.get_slot_data(player)
+        inventory: collections.Counter[int] = tracker_data.get_player_inventory_counts(team, player)
+        item_id_to_name = tracker_data.item_id_to_name["Starcraft 2"]
+        location_id_to_name = tracker_data.location_id_to_name["Starcraft 2"]
 
-            "Infantry Weapons Level 1":                    "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-infantryweaponslevel1.png",
-            "Infantry Weapons Level 2":                    "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-infantryweaponslevel2.png",
-            "Infantry Weapons Level 3":                    "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-infantryweaponslevel3.png",
-            "Infantry Armor Level 1":                      "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-infantryarmorlevel1.png",
-            "Infantry Armor Level 2":                      "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-infantryarmorlevel2.png",
-            "Infantry Armor Level 3":                      "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-infantryarmorlevel3.png",
-            "Vehicle Weapons Level 1":                     "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-vehicleweaponslevel1.png",
-            "Vehicle Weapons Level 2":                     "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-vehicleweaponslevel2.png",
-            "Vehicle Weapons Level 3":                     "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-vehicleweaponslevel3.png",
-            "Vehicle Armor Level 1":                       "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-vehicleplatinglevel1.png",
-            "Vehicle Armor Level 2":                       "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-vehicleplatinglevel2.png",
-            "Vehicle Armor Level 3":                       "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-vehicleplatinglevel3.png",
-            "Ship Weapons Level 1":                        "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-shipweaponslevel1.png",
-            "Ship Weapons Level 2":                        "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-shipweaponslevel2.png",
-            "Ship Weapons Level 3":                        "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-shipweaponslevel3.png",
-            "Ship Armor Level 1":                          "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-shipplatinglevel1.png",
-            "Ship Armor Level 2":                          "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-shipplatinglevel2.png",
-            "Ship Armor Level 3":                          "https://sclegacy.com/images/uploaded/starcraftii_beta/gamefiles/upgrades/btn-upgrade-terran-shipplatinglevel3.png",
-
-            "Bunker":                                      "https://static.wikia.nocookie.net/starcraft/images/c/c5/Bunker_SC2_Icon1.jpg",
-            "Missile Turret":                              "https://static.wikia.nocookie.net/starcraft/images/5/5f/MissileTurret_SC2_Icon1.jpg",
-            "Sensor Tower":                                "https://static.wikia.nocookie.net/starcraft/images/d/d2/SensorTower_SC2_Icon1.jpg",
-
-            "Projectile Accelerator (Bunker)":             "https://0rganics.org/archipelago/sc2wol/ProjectileAccelerator.png",
-            "Neosteel Bunker (Bunker)":                    "https://0rganics.org/archipelago/sc2wol/NeosteelBunker.png",
-            "Titanium Housing (Missile Turret)":           "https://0rganics.org/archipelago/sc2wol/TitaniumHousing.png",
-            "Hellstorm Batteries (Missile Turret)":        "https://0rganics.org/archipelago/sc2wol/HellstormBatteries.png",
-            "Advanced Construction (SCV)":                 "https://0rganics.org/archipelago/sc2wol/AdvancedConstruction.png",
-            "Dual-Fusion Welders (SCV)":                   "https://0rganics.org/archipelago/sc2wol/Dual-FusionWelders.png",
-            "Fire-Suppression System (Building)":          "https://0rganics.org/archipelago/sc2wol/Fire-SuppressionSystem.png",
-            "Orbital Command (Building)":                  "https://0rganics.org/archipelago/sc2wol/OrbitalCommandCampaign.png",
-
-            "Marine":                                      "https://static.wikia.nocookie.net/starcraft/images/4/47/Marine_SC2_Icon1.jpg",
-            "Medic":                                       "https://static.wikia.nocookie.net/starcraft/images/7/74/Medic_SC2_Rend1.jpg",
-            "Firebat":                                     "https://static.wikia.nocookie.net/starcraft/images/3/3c/Firebat_SC2_Rend1.jpg",
-            "Marauder":                                    "https://static.wikia.nocookie.net/starcraft/images/b/ba/Marauder_SC2_Icon1.jpg",
-            "Reaper":                                      "https://static.wikia.nocookie.net/starcraft/images/7/7d/Reaper_SC2_Icon1.jpg",
-
-            "Stimpack (Marine)":                           "https://0rganics.org/archipelago/sc2wol/StimpacksCampaign.png",
-            "Super Stimpack (Marine)":                     "/static/static/icons/sc2/superstimpack.png",
-            "Combat Shield (Marine)":                      "https://0rganics.org/archipelago/sc2wol/CombatShieldCampaign.png",
-            "Laser Targeting System (Marine)":             "/static/static/icons/sc2/lasertargetingsystem.png",
-            "Magrail Munitions (Marine)":                  "/static/static/icons/sc2/magrailmunitions.png",
-            "Optimized Logistics (Marine)":                "/static/static/icons/sc2/optimizedlogistics.png",
-            "Advanced Medic Facilities (Medic)":           "https://0rganics.org/archipelago/sc2wol/AdvancedMedicFacilities.png",
-            "Stabilizer Medpacks (Medic)":                 "https://0rganics.org/archipelago/sc2wol/StabilizerMedpacks.png",
-            "Restoration (Medic)":                         "/static/static/icons/sc2/restoration.png",
-            "Optical Flare (Medic)":                       "/static/static/icons/sc2/opticalflare.png",
-            "Optimized Logistics (Medic)":                 "/static/static/icons/sc2/optimizedlogistics.png",
-            "Incinerator Gauntlets (Firebat)":             "https://0rganics.org/archipelago/sc2wol/IncineratorGauntlets.png",
-            "Juggernaut Plating (Firebat)":                "https://0rganics.org/archipelago/sc2wol/JuggernautPlating.png",
-            "Stimpack (Firebat)":                          "https://0rganics.org/archipelago/sc2wol/StimpacksCampaign.png",
-            "Super Stimpack (Firebat)":                    "/static/static/icons/sc2/superstimpack.png",
-            "Optimized Logistics (Firebat)":               "/static/static/icons/sc2/optimizedlogistics.png",
-            "Concussive Shells (Marauder)":                "https://0rganics.org/archipelago/sc2wol/ConcussiveShellsCampaign.png",
-            "Kinetic Foam (Marauder)":                     "https://0rganics.org/archipelago/sc2wol/KineticFoam.png",
-            "Stimpack (Marauder)":                         "https://0rganics.org/archipelago/sc2wol/StimpacksCampaign.png",
-            "Super Stimpack (Marauder)":                   "/static/static/icons/sc2/superstimpack.png",
-            "Laser Targeting System (Marauder)":           "/static/static/icons/sc2/lasertargetingsystem.png",
-            "Magrail Munitions (Marauder)":                "/static/static/icons/sc2/magrailmunitions.png",
-            "Internal Tech Module (Marauder)":             "/static/static/icons/sc2/internalizedtechmodule.png",
-            "U-238 Rounds (Reaper)":                       "https://0rganics.org/archipelago/sc2wol/U-238Rounds.png",
-            "G-4 Clusterbomb (Reaper)":                    "https://0rganics.org/archipelago/sc2wol/G-4Clusterbomb.png",
-            "Stimpack (Reaper)":                           "https://0rganics.org/archipelago/sc2wol/StimpacksCampaign.png",
-            "Super Stimpack (Reaper)":                     "/static/static/icons/sc2/superstimpack.png",
-            "Laser Targeting System (Reaper)":             "/static/static/icons/sc2/lasertargetingsystem.png",
-            "Advanced Cloaking Field (Reaper)":            "/static/static/icons/sc2/terran-cloak-color.png",
-            "Spider Mines (Reaper)":                       "/static/static/icons/sc2/spidermine.png",
-            "Combat Drugs (Reaper)":                       "/static/static/icons/sc2/reapercombatdrugs.png",
-
-            "Hellion":                                     "https://static.wikia.nocookie.net/starcraft/images/5/56/Hellion_SC2_Icon1.jpg",
-            "Vulture":                                     "https://static.wikia.nocookie.net/starcraft/images/d/da/Vulture_WoL.jpg",
-            "Goliath":                                     "https://static.wikia.nocookie.net/starcraft/images/e/eb/Goliath_WoL.jpg",
-            "Diamondback":                                 "https://static.wikia.nocookie.net/starcraft/images/a/a6/Diamondback_WoL.jpg",
-            "Siege Tank":                                  "https://static.wikia.nocookie.net/starcraft/images/5/57/SiegeTank_SC2_Icon1.jpg",
-
-            "Twin-Linked Flamethrower (Hellion)":          "https://0rganics.org/archipelago/sc2wol/Twin-LinkedFlamethrower.png",
-            "Thermite Filaments (Hellion)":                "https://0rganics.org/archipelago/sc2wol/ThermiteFilaments.png",
-            "Hellbat Aspect (Hellion)":                    "/static/static/icons/sc2/hellionbattlemode.png",
-            "Smart Servos (Hellion)":                      "/static/static/icons/sc2/transformationservos.png",
-            "Optimized Logistics (Hellion)":               "/static/static/icons/sc2/optimizedlogistics.png",
-            "Jump Jets (Hellion)":                         "/static/static/icons/sc2/jumpjets.png",
-            "Stimpack (Hellion)":                          "https://0rganics.org/archipelago/sc2wol/StimpacksCampaign.png",
-            "Super Stimpack (Hellion)":                    "/static/static/icons/sc2/superstimpack.png",
-            "Cerberus Mine (Spider Mine)":                 "https://0rganics.org/archipelago/sc2wol/CerberusMine.png",
-            "High Explosive Munition (Spider Mine)":       "/static/static/icons/sc2/high-explosive-spidermine.png",
-            "Replenishable Magazine (Vulture)":            "https://0rganics.org/archipelago/sc2wol/ReplenishableMagazine.png",
-            "Ion Thrusters (Vulture)":                     "/static/static/icons/sc2/emergencythrusters.png",
-            "Auto Launchers (Vulture)":                    "/static/static/icons/sc2/jotunboosters.png",
-            "Multi-Lock Weapons System (Goliath)":         "https://0rganics.org/archipelago/sc2wol/Multi-LockWeaponsSystem.png",
-            "Ares-Class Targeting System (Goliath)":       "https://0rganics.org/archipelago/sc2wol/Ares-ClassTargetingSystem.png",
-            "Jump Jets (Goliath)":                         "/static/static/icons/sc2/jumpjets.png",
-            "Optimized Logistics (Goliath)":               "/static/static/icons/sc2/optimizedlogistics.png",
-            "Tri-Lithium Power Cell (Diamondback)":        "https://0rganics.org/archipelago/sc2wol/Tri-LithiumPowerCell.png",
-            "Shaped Hull (Diamondback)":                   "https://0rganics.org/archipelago/sc2wol/ShapedHull.png",
-            "Hyperfluxor (Diamondback)":                   "/static/static/icons/sc2/hyperfluxor.png",
-            "Burst Capacitors (Diamondback)":              "/static/static/icons/sc2/burstcapacitors.png",
-            "Optimized Logistics (Diamondback)":           "/static/static/icons/sc2/optimizedlogistics.png",
-            "Maelstrom Rounds (Siege Tank)":               "https://0rganics.org/archipelago/sc2wol/MaelstromRounds.png",
-            "Shaped Blast (Siege Tank)":                   "https://0rganics.org/archipelago/sc2wol/ShapedBlast.png",
-            "Jump Jets (Siege Tank)":                      "/static/static/icons/sc2/jumpjets.png",
-            "Spider Mines (Siege Tank)":                   "/static/static/icons/sc2/siegetank-spidermines.png",
-            "Smart Servos (Siege Tank)":                   "/static/static/icons/sc2/transformationservos.png",
-            "Graduating Range (Siege Tank)":               "/static/static/icons/sc2/siegetankrange.png",
-            "Laser Targeting System (Siege Tank)":         "/static/static/icons/sc2/lasertargetingsystem.png",
-            "Advanced Siege Tech (Siege Tank)":            "/static/static/icons/sc2/improvedsiegemode.png",
-            "Internal Tech Module (Siege Tank)":           "/static/static/icons/sc2/internalizedtechmodule.png",
-
-            "Medivac":                                     "https://static.wikia.nocookie.net/starcraft/images/d/db/Medivac_SC2_Icon1.jpg",
-            "Wraith":                                      "https://static.wikia.nocookie.net/starcraft/images/7/75/Wraith_WoL.jpg",
-            "Viking":                                      "https://static.wikia.nocookie.net/starcraft/images/2/2a/Viking_SC2_Icon1.jpg",
-            "Banshee":                                     "https://static.wikia.nocookie.net/starcraft/images/3/32/Banshee_SC2_Icon1.jpg",
-            "Battlecruiser":                               "https://static.wikia.nocookie.net/starcraft/images/f/f5/Battlecruiser_SC2_Icon1.jpg",
-
-            "Rapid Deployment Tube (Medivac)":             "https://0rganics.org/archipelago/sc2wol/RapidDeploymentTube.png",
-            "Advanced Healing AI (Medivac)":               "https://0rganics.org/archipelago/sc2wol/AdvancedHealingAI.png",
-            "Expanded Hull (Medivac)":                     "/static/static/icons/sc2/neosteelfortifiedarmor.png",
-            "Afterburners (Medivac)":                      "/static/static/icons/sc2/medivacemergencythrusters.png",
-            "Tomahawk Power Cells (Wraith)":               "https://0rganics.org/archipelago/sc2wol/TomahawkPowerCells.png",
-            "Displacement Field (Wraith)":                 "https://0rganics.org/archipelago/sc2wol/DisplacementField.png",
-            "Advanced Laser Technology (Wraith)":          "/static/static/icons/sc2/improvedburstlaser.png",
-            "Ripwave Missiles (Viking)":                   "https://0rganics.org/archipelago/sc2wol/RipwaveMissiles.png",
-            "Phobos-Class Weapons System (Viking)":        "https://0rganics.org/archipelago/sc2wol/Phobos-ClassWeaponsSystem.png",
-            "Smart Servos (Viking)":                       "/static/static/icons/sc2/transformationservos.png",
-            "Magrail Munitions (Viking)":                  "/static/static/icons/sc2/magrailmunitions.png",
-            "Cross-Spectrum Dampeners (Banshee)":          "/static/static/icons/sc2/crossspectrumdampeners.png",
-            "Advanced Cross-Spectrum Dampeners (Banshee)": "https://0rganics.org/archipelago/sc2wol/Cross-SpectrumDampeners.png",
-            "Shockwave Missile Battery (Banshee)":         "https://0rganics.org/archipelago/sc2wol/ShockwaveMissileBattery.png",
-            "Hyperflight Rotors (Banshee)":                "/static/static/icons/sc2/hyperflightrotors.png",
-            "Laser Targeting System (Banshee)":            "/static/static/icons/sc2/lasertargetingsystem.png",
-            "Internal Tech Module (Banshee)":              "/static/static/icons/sc2/internalizedtechmodule.png",
-            "Missile Pods (Battlecruiser)":                "https://0rganics.org/archipelago/sc2wol/MissilePods.png",
-            "Defensive Matrix (Battlecruiser)":            "https://0rganics.org/archipelago/sc2wol/DefensiveMatrix.png",
-            "Tactical Jump (Battlecruiser)":               "/static/static/icons/sc2/warpjump.png",
-            "Cloak (Battlecruiser)":                       "/static/static/icons/sc2/terran-cloak-color.png",
-            "ATX Laser Battery (Battlecruiser)":           "/static/static/icons/sc2/specialordance.png",
-            "Optimized Logistics (Battlecruiser)":         "/static/static/icons/sc2/optimizedlogistics.png",
-            "Internal Tech Module (Battlecruiser)":        "/static/static/icons/sc2/internalizedtechmodule.png",
-
-            "Ghost":                                       "https://static.wikia.nocookie.net/starcraft/images/6/6e/Ghost_SC2_Icon1.jpg",
-            "Spectre":                                     "https://static.wikia.nocookie.net/starcraft/images/0/0d/Spectre_WoL.jpg",
-            "Thor":                                        "https://static.wikia.nocookie.net/starcraft/images/e/ef/Thor_SC2_Icon1.jpg",
-
-            "Widow Mine":                                  "/static/static/icons/sc2/widowmine.png",
-            "Cyclone":                                     "/static/static/icons/sc2/cyclone.png",
-            "Liberator":                                   "/static/static/icons/sc2/liberator.png",
-            "Valkyrie":                                    "/static/static/icons/sc2/valkyrie.png",
-
-            "Ocular Implants (Ghost)":                     "https://0rganics.org/archipelago/sc2wol/OcularImplants.png",
-            "Crius Suit (Ghost)":                          "https://0rganics.org/archipelago/sc2wol/CriusSuit.png",
-            "EMP Rounds (Ghost)":                          "/static/static/icons/sc2/terran-emp-color.png",
-            "Lockdown (Ghost)":                            "/static/static/icons/sc2/lockdown.png",
-            "Psionic Lash (Spectre)":                      "https://0rganics.org/archipelago/sc2wol/PsionicLash.png",
-            "Nyx-Class Cloaking Module (Spectre)":         "https://0rganics.org/archipelago/sc2wol/Nyx-ClassCloakingModule.png",
-            "Impaler Rounds (Spectre)":                    "/static/static/icons/sc2/impalerrounds.png",
-            "330mm Barrage Cannon (Thor)":                 "https://0rganics.org/archipelago/sc2wol/330mmBarrageCannon.png",
-            "Immortality Protocol (Thor)":                 "https://0rganics.org/archipelago/sc2wol/ImmortalityProtocol.png",
-            "High Impact Payload (Thor)":                  "/static/static/icons/sc2/thorsiegemode.png",
-            "Smart Servos (Thor)":                         "/static/static/icons/sc2/transformationservos.png",
-
-            "Optimized Logistics (Predator)":              "/static/static/icons/sc2/optimizedlogistics.png",
-            "Drilling Claws (Widow Mine)":                 "/static/static/icons/sc2/drillingclaws.png",
-            "Concealment (Widow Mine)":                    "/static/static/icons/sc2/widowminehidden.png",
-            "Black Market Launchers (Widow Mine)":         "/static/static/icons/sc2/widowmine-attackrange.png",
-            "Executioner Missiles (Widow Mine)":           "/static/static/icons/sc2/widowmine-deathblossom.png",
-            "Mag-Field Accelerators (Cyclone)":            "/static/static/icons/sc2/magfieldaccelerator.png",
-            "Mag-Field Launchers (Cyclone)":               "/static/static/icons/sc2/cyclonerangeupgrade.png",
-            "Targeting Optics (Cyclone)":                  "/static/static/icons/sc2/targetingoptics.png",
-            "Rapid Fire Launchers (Cyclone)":              "/static/static/icons/sc2/ripwavemissiles.png",
-            "Bio Mechanical Repair Drone (Raven)":         "/static/static/icons/sc2/biomechanicaldrone.png",
-            "Spider Mines (Raven)":                        "/static/static/icons/sc2/siegetank-spidermines.png",
-            "Railgun Turret (Raven)":                      "/static/static/icons/sc2/autoturretblackops.png",
-            "Hunter-Seeker Weapon (Raven)":                "/static/static/icons/sc2/specialordance.png",
-            "Interference Matrix (Raven)":                 "/static/static/icons/sc2/interferencematrix.png",
-            "Anti-Armor Missile (Raven)":                  "/static/static/icons/sc2/shreddermissile.png",
-            "Internal Tech Module (Raven)":                "/static/static/icons/sc2/internalizedtechmodule.png",
-            "EMP Shockwave (Science Vessel)":              "/static/static/icons/sc2/staticempblast.png",
-            "Defensive Matrix (Science Vessel)":           "https://0rganics.org/archipelago/sc2wol/DefensiveMatrix.png",
-            "Advanced Ballistics (Liberator)":             "/static/static/icons/sc2/advanceballistics.png",
-            "Raid Artillery (Liberator)":                  "/static/static/icons/sc2/terrandefendermodestructureattack.png",
-            "Cloak (Liberator)":                           "/static/static/icons/sc2/terran-cloak-color.png",
-            "Laser Targeting System (Liberator)":          "/static/static/icons/sc2/lasertargetingsystem.png",
-            "Optimized Logistics (Liberator)":             "/static/static/icons/sc2/optimizedlogistics.png",
-            "Enhanced Cluster Launchers (Valkyrie)":       "https://0rganics.org/archipelago/sc2wol/HellstormBatteries.png",
-            "Shaped Hull (Valkyrie)":                      "https://0rganics.org/archipelago/sc2wol/ShapedHull.png",
-            "Burst Lasers (Valkyrie)":                     "/static/static/icons/sc2/improvedburstlaser.png",
-            "Afterburners (Valkyrie)":                     "/static/static/icons/sc2/medivacemergencythrusters.png",
-
-            "War Pigs":                                    "https://static.wikia.nocookie.net/starcraft/images/e/ed/WarPigs_SC2_Icon1.jpg",
-            "Devil Dogs":                                  "https://static.wikia.nocookie.net/starcraft/images/3/33/DevilDogs_SC2_Icon1.jpg",
-            "Hammer Securities":                           "https://static.wikia.nocookie.net/starcraft/images/3/3b/HammerSecurity_SC2_Icon1.jpg",
-            "Spartan Company":                             "https://static.wikia.nocookie.net/starcraft/images/b/be/SpartanCompany_SC2_Icon1.jpg",
-            "Siege Breakers":                              "https://static.wikia.nocookie.net/starcraft/images/3/31/SiegeBreakers_SC2_Icon1.jpg",
-            "Hel's Angel":                                 "https://static.wikia.nocookie.net/starcraft/images/6/63/HelsAngels_SC2_Icon1.jpg",
-            "Dusk Wings":                                  "https://static.wikia.nocookie.net/starcraft/images/5/52/DuskWings_SC2_Icon1.jpg",
-            "Jackson's Revenge":                           "https://static.wikia.nocookie.net/starcraft/images/9/95/JacksonsRevenge_SC2_Icon1.jpg",
-
-            "Ultra-Capacitors":                            "https://static.wikia.nocookie.net/starcraft/images/2/23/SC2_Lab_Ultra_Capacitors_Icon.png",
-            "Vanadium Plating":                            "https://static.wikia.nocookie.net/starcraft/images/6/67/SC2_Lab_VanPlating_Icon.png",
-            "Orbital Depots":                              "https://static.wikia.nocookie.net/starcraft/images/0/01/SC2_Lab_Orbital_Depot_Icon.png",
-            "Micro-Filtering":                             "https://static.wikia.nocookie.net/starcraft/images/2/20/SC2_Lab_MicroFilter_Icon.png",
-            "Automated Refinery":                          "https://static.wikia.nocookie.net/starcraft/images/7/71/SC2_Lab_Auto_Refinery_Icon.png",
-            "Command Center Reactor":                      "https://static.wikia.nocookie.net/starcraft/images/e/ef/SC2_Lab_CC_Reactor_Icon.png",
-            "Raven":                                       "https://static.wikia.nocookie.net/starcraft/images/1/19/SC2_Lab_Raven_Icon.png",
-            "Science Vessel":                              "https://static.wikia.nocookie.net/starcraft/images/c/c3/SC2_Lab_SciVes_Icon.png",
-            "Tech Reactor":                                "https://static.wikia.nocookie.net/starcraft/images/c/c5/SC2_Lab_Tech_Reactor_Icon.png",
-            "Orbital Strike":                              "https://static.wikia.nocookie.net/starcraft/images/d/df/SC2_Lab_Orb_Strike_Icon.png",
-
-            "Shrike Turret (Bunker)":                      "https://static.wikia.nocookie.net/starcraft/images/4/44/SC2_Lab_Shrike_Turret_Icon.png",
-            "Fortified Bunker (Bunker)":                   "https://static.wikia.nocookie.net/starcraft/images/4/4f/SC2_Lab_FortBunker_Icon.png",
-            "Planetary Fortress":                          "https://static.wikia.nocookie.net/starcraft/images/0/0b/SC2_Lab_PlanetFortress_Icon.png",
-            "Perdition Turret":                            "https://static.wikia.nocookie.net/starcraft/images/a/af/SC2_Lab_PerdTurret_Icon.png",
-            "Predator":                                    "https://static.wikia.nocookie.net/starcraft/images/8/83/SC2_Lab_Predator_Icon.png",
-            "Hercules":                                    "https://static.wikia.nocookie.net/starcraft/images/4/40/SC2_Lab_Hercules_Icon.png",
-            "Cellular Reactor":                            "https://static.wikia.nocookie.net/starcraft/images/d/d8/SC2_Lab_CellReactor_Icon.png",
-            "Regenerative Bio-Steel Level 1":              "/static/static/icons/sc2/SC2_Lab_BioSteel_L1.png",
-            "Regenerative Bio-Steel Level 2":              "/static/static/icons/sc2/SC2_Lab_BioSteel_L2.png",
-            "Hive Mind Emulator":                          "https://static.wikia.nocookie.net/starcraft/images/b/bc/SC2_Lab_Hive_Emulator_Icon.png",
-            "Psi Disrupter":                               "https://static.wikia.nocookie.net/starcraft/images/c/cf/SC2_Lab_Psi_Disruptor_Icon.png",
-
-            "Zealot":                                      "https://static.wikia.nocookie.net/starcraft/images/6/6e/Icon_Protoss_Zealot.jpg",
-            "Stalker":                                     "https://static.wikia.nocookie.net/starcraft/images/0/0d/Icon_Protoss_Stalker.jpg",
-            "High Templar":                                "https://static.wikia.nocookie.net/starcraft/images/a/a0/Icon_Protoss_High_Templar.jpg",
-            "Dark Templar":                                "https://static.wikia.nocookie.net/starcraft/images/9/90/Icon_Protoss_Dark_Templar.jpg",
-            "Immortal":                                    "https://static.wikia.nocookie.net/starcraft/images/c/c1/Icon_Protoss_Immortal.jpg",
-            "Colossus":                                    "https://static.wikia.nocookie.net/starcraft/images/4/40/Icon_Protoss_Colossus.jpg",
-            "Phoenix":                                     "https://static.wikia.nocookie.net/starcraft/images/b/b1/Icon_Protoss_Phoenix.jpg",
-            "Void Ray":                                    "https://static.wikia.nocookie.net/starcraft/images/1/1d/VoidRay_SC2_Rend1.jpg",
-            "Carrier":                                     "https://static.wikia.nocookie.net/starcraft/images/2/2c/Icon_Protoss_Carrier.jpg",
-
-            "Nothing":                                     "",
-        }
-        sc2wol_location_ids = {
-            "Liberation Day":          range(SC2WOL_LOC_ID_OFFSET + 100, SC2WOL_LOC_ID_OFFSET + 200),
-            "The Outlaws":             range(SC2WOL_LOC_ID_OFFSET + 200, SC2WOL_LOC_ID_OFFSET + 300),
-            "Zero Hour":               range(SC2WOL_LOC_ID_OFFSET + 300, SC2WOL_LOC_ID_OFFSET + 400),
-            "Evacuation":              range(SC2WOL_LOC_ID_OFFSET + 400, SC2WOL_LOC_ID_OFFSET + 500),
-            "Outbreak":                range(SC2WOL_LOC_ID_OFFSET + 500, SC2WOL_LOC_ID_OFFSET + 600),
-            "Safe Haven":              range(SC2WOL_LOC_ID_OFFSET + 600, SC2WOL_LOC_ID_OFFSET + 700),
-            "Haven's Fall":            range(SC2WOL_LOC_ID_OFFSET + 700, SC2WOL_LOC_ID_OFFSET + 800),
-            "Smash and Grab":          range(SC2WOL_LOC_ID_OFFSET + 800, SC2WOL_LOC_ID_OFFSET + 900),
-            "The Dig":                 range(SC2WOL_LOC_ID_OFFSET + 900, SC2WOL_LOC_ID_OFFSET + 1000),
-            "The Moebius Factor":      range(SC2WOL_LOC_ID_OFFSET + 1000, SC2WOL_LOC_ID_OFFSET + 1100),
-            "Supernova":               range(SC2WOL_LOC_ID_OFFSET + 1100, SC2WOL_LOC_ID_OFFSET + 1200),
-            "Maw of the Void":         range(SC2WOL_LOC_ID_OFFSET + 1200, SC2WOL_LOC_ID_OFFSET + 1300),
-            "Devil's Playground":      range(SC2WOL_LOC_ID_OFFSET + 1300, SC2WOL_LOC_ID_OFFSET + 1400),
-            "Welcome to the Jungle":   range(SC2WOL_LOC_ID_OFFSET + 1400, SC2WOL_LOC_ID_OFFSET + 1500),
-            "Breakout":                range(SC2WOL_LOC_ID_OFFSET + 1500, SC2WOL_LOC_ID_OFFSET + 1600),
-            "Ghost of a Chance":       range(SC2WOL_LOC_ID_OFFSET + 1600, SC2WOL_LOC_ID_OFFSET + 1700),
-            "The Great Train Robbery": range(SC2WOL_LOC_ID_OFFSET + 1700, SC2WOL_LOC_ID_OFFSET + 1800),
-            "Cutthroat":               range(SC2WOL_LOC_ID_OFFSET + 1800, SC2WOL_LOC_ID_OFFSET + 1900),
-            "Engine of Destruction":   range(SC2WOL_LOC_ID_OFFSET + 1900, SC2WOL_LOC_ID_OFFSET + 2000),
-            "Media Blitz":             range(SC2WOL_LOC_ID_OFFSET + 2000, SC2WOL_LOC_ID_OFFSET + 2100),
-            "Piercing the Shroud":     range(SC2WOL_LOC_ID_OFFSET + 2100, SC2WOL_LOC_ID_OFFSET + 2200),
-            "Whispers of Doom":        range(SC2WOL_LOC_ID_OFFSET + 2200, SC2WOL_LOC_ID_OFFSET + 2300),
-            "A Sinister Turn":         range(SC2WOL_LOC_ID_OFFSET + 2300, SC2WOL_LOC_ID_OFFSET + 2400),
-            "Echoes of the Future":    range(SC2WOL_LOC_ID_OFFSET + 2400, SC2WOL_LOC_ID_OFFSET + 2500),
-            "In Utter Darkness":       range(SC2WOL_LOC_ID_OFFSET + 2500, SC2WOL_LOC_ID_OFFSET + 2600),
-            "Gates of Hell":           range(SC2WOL_LOC_ID_OFFSET + 2600, SC2WOL_LOC_ID_OFFSET + 2700),
-            "Belly of the Beast":      range(SC2WOL_LOC_ID_OFFSET + 2700, SC2WOL_LOC_ID_OFFSET + 2800),
-            "Shatter the Sky":         range(SC2WOL_LOC_ID_OFFSET + 2800, SC2WOL_LOC_ID_OFFSET + 2900),
-        }
-
+        # Filler item counters
         display_data = {}
+        display_data["minerals_count"] = slot_data.get("minerals_per_item", 15) * inventory.get(STARTING_MINERALS_ITEM_ID, 0)
+        display_data["vespene_count"] = slot_data.get("vespene_per_item", 15) * inventory.get(STARTING_VESPENE_ITEM_ID, 0)
+        display_data["supply_count"] = slot_data.get("starting_supply_per_item", 2) * inventory.get(STARTING_SUPPLY_ITEM_ID, 0)
+        display_data["max_supply_count"] = slot_data.get("maximum_supply_per_item", 1) * inventory.get(MAX_SUPPLY_ITEM_ID, 0)
+        display_data["reduced_supply_count"] = slot_data.get("maximum_supply_reduction_per_item", 1) * inventory.get(REDUCED_MAX_SUPPLY_ITEM_ID, 0)
+        display_data["construction_speed_count"] = inventory.get(BUILDING_CONSTRUCTION_SPEED_ITEM_ID, 0)
+        display_data["shield_regen_count"] = inventory.get(SHIELD_REGENERATION_ITEM_ID, 0)
+        display_data["upgrade_speed_count"] = inventory.get(UPGRADE_RESEARCH_SPEED_ITEM_ID, 0)
+        display_data["research_cost_count"] = inventory.get(UPGRADE_RESEARCH_COST_ITEM_ID, 0)
 
-        # Grouped Items
-        grouped_item_ids = {
-            "Progressive Weapon Upgrade":       107 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Armor Upgrade":        108 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Infantry Upgrade":     109 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Vehicle Upgrade":      110 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Ship Upgrade":         111 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Weapon/Armor Upgrade": 112 + SC2WOL_ITEM_ID_OFFSET
-        }
+        # Locations
+        have_nco_locations = False
+        locations = tracker_data.get_player_locations(player)
+        checked_locations = tracker_data.get_player_checked_locations(team, player)
+        missions: dict[str, list[tuple[str, bool]]] = {}
+        for location_id in locations:
+            location_name = location_id_to_name.get(location_id, "")
+            if ":" not in location_name:
+                continue
+            mission_name = location_name.split(":", 1)[0]
+            missions.setdefault(mission_name, []).append((location_name, location_id in checked_locations))
+            if location_id >= NCO_LOCATION_ID_LOW and location_id < NCO_LOCATION_ID_HIGH:
+                have_nco_locations = True
+        missions = {mission: missions[mission] for mission in sorted(missions)}
+
+        # Kerrigan level
+        level_item_id_to_amount = (
+            (509 + SC2HOTS_ITEM_ID_OFFSET, 1,),
+            (508 + SC2HOTS_ITEM_ID_OFFSET, 2,),
+            (507 + SC2HOTS_ITEM_ID_OFFSET, 3,),
+            (506 + SC2HOTS_ITEM_ID_OFFSET, 4,),
+            (505 + SC2HOTS_ITEM_ID_OFFSET, 5,),
+            (504 + SC2HOTS_ITEM_ID_OFFSET, 6,),
+            (503 + SC2HOTS_ITEM_ID_OFFSET, 7,),
+            (502 + SC2HOTS_ITEM_ID_OFFSET, 8,),
+            (501 + SC2HOTS_ITEM_ID_OFFSET, 9,),
+            (500 + SC2HOTS_ITEM_ID_OFFSET, 10,),
+            (510 + SC2HOTS_ITEM_ID_OFFSET, 14,),
+            (511 + SC2HOTS_ITEM_ID_OFFSET, 35,),
+            (512 + SC2HOTS_ITEM_ID_OFFSET, 70,),
+        )
+        kerrigan_level = 0
+        for item_id, levels_per_item in level_item_id_to_amount:
+            kerrigan_level += levels_per_item * inventory[item_id]
+        display_data["kerrigan_level"] = kerrigan_level
+
+        # Hero presence
+        display_data["kerrigan_present"] = slot_data.get("kerrigan_presence", 0) == 0
+        display_data["nova_present"] = have_nco_locations
+
+        # Upgrades
+        TERRAN_INFANTRY_WEAPON_ID = 100 + SC2WOL_ITEM_ID_OFFSET
+        TERRAN_INFANTRY_ARMOR_ID =  102 + SC2WOL_ITEM_ID_OFFSET
+        TERRAN_VEHICLE_WEAPON_ID =  103 + SC2WOL_ITEM_ID_OFFSET
+        TERRAN_VEHICLE_ARMOR_ID =   104 + SC2WOL_ITEM_ID_OFFSET
+        TERRAN_SHIP_WEAPON_ID =     105 + SC2WOL_ITEM_ID_OFFSET
+        TERRAN_SHIP_ARMOR_ID =      106 + SC2WOL_ITEM_ID_OFFSET
+        ZERG_MELEE_ATTACK_ID =      100 + SC2HOTS_ITEM_ID_OFFSET
+        ZERG_MISSILE_ATTACK_ID =    101 + SC2HOTS_ITEM_ID_OFFSET
+        ZERG_GROUND_CARAPACE_ID =   102 + SC2HOTS_ITEM_ID_OFFSET
+        ZERG_FLYER_ATTACK_ID =      103 + SC2HOTS_ITEM_ID_OFFSET
+        ZERG_FLYER_CARAPACE_ID =    104 + SC2HOTS_ITEM_ID_OFFSET
+        PROTOSS_GROUND_WEAPON_ID =  100 + SC2LOTV_ITEM_ID_OFFSET
+        PROTOSS_GROUND_ARMOR_ID =   101 + SC2LOTV_ITEM_ID_OFFSET
+        PROTOSS_SHIELDS_ID =        102 + SC2LOTV_ITEM_ID_OFFSET
+        PROTOSS_AIR_WEAPON_ID =     103 + SC2LOTV_ITEM_ID_OFFSET
+        PROTOSS_AIR_ARMOR_ID =      104 + SC2LOTV_ITEM_ID_OFFSET
+
+        # Bundles
+        TERRAN_WEAPON_UPGRADE_ID =        107 + SC2WOL_ITEM_ID_OFFSET
+        TERRAN_ARMOR_UPGRADE_ID =         108 + SC2WOL_ITEM_ID_OFFSET
+        TERRAN_INFANTRY_UPGRADE_ID =      109 + SC2WOL_ITEM_ID_OFFSET
+        TERRAN_VEHICLE_UPGRADE_ID =       110 + SC2WOL_ITEM_ID_OFFSET
+        TERRAN_SHIP_UPGRADE_ID =          111 + SC2WOL_ITEM_ID_OFFSET
+        TERRAN_WEAPON_ARMOR_UPGRADE_ID =  112 + SC2WOL_ITEM_ID_OFFSET
+        ZERG_WEAPON_UPGRADE_ID =          105 + SC2HOTS_ITEM_ID_OFFSET
+        ZERG_ARMOR_UPGRADE_ID =           106 + SC2HOTS_ITEM_ID_OFFSET
+        ZERG_GROUND_UPGRADE_ID =          107 + SC2HOTS_ITEM_ID_OFFSET
+        ZERG_FLYER_UPGRADE_ID =           108 + SC2HOTS_ITEM_ID_OFFSET
+        ZERG_WEAPON_ARMOR_UPGRADE_ID =    109 + SC2HOTS_ITEM_ID_OFFSET
+        PROTOSS_WEAPON_UPGRADE_ID =       105 + SC2LOTV_ITEM_ID_OFFSET
+        PROTOSS_ARMOR_UPGRADE_ID =        106 + SC2LOTV_ITEM_ID_OFFSET
+        PROTOSS_GROUND_UPGRADE_ID =       107 + SC2LOTV_ITEM_ID_OFFSET
+        PROTOSS_AIR_UPGRADE_ID =          108 + SC2LOTV_ITEM_ID_OFFSET
+        PROTOSS_WEAPON_ARMOR_UPGRADE_ID = 109 + SC2LOTV_ITEM_ID_OFFSET
         grouped_item_replacements = {
-            "Progressive Weapon Upgrade":   ["Progressive Infantry Weapon", "Progressive Vehicle Weapon",
-                                             "Progressive Ship Weapon"],
-            "Progressive Armor Upgrade":    ["Progressive Infantry Armor", "Progressive Vehicle Armor",
-                                             "Progressive Ship Armor"],
-            "Progressive Infantry Upgrade": ["Progressive Infantry Weapon", "Progressive Infantry Armor"],
-            "Progressive Vehicle Upgrade":  ["Progressive Vehicle Weapon", "Progressive Vehicle Armor"],
-            "Progressive Ship Upgrade":     ["Progressive Ship Weapon", "Progressive Ship Armor"]
+            TERRAN_WEAPON_UPGRADE_ID: [
+                TERRAN_INFANTRY_WEAPON_ID,
+                TERRAN_VEHICLE_WEAPON_ID,
+                TERRAN_SHIP_WEAPON_ID,
+            ],
+            TERRAN_ARMOR_UPGRADE_ID: [
+                TERRAN_INFANTRY_ARMOR_ID,
+                TERRAN_VEHICLE_ARMOR_ID,
+                TERRAN_SHIP_ARMOR_ID,
+            ],
+            TERRAN_INFANTRY_UPGRADE_ID: [
+                TERRAN_INFANTRY_WEAPON_ID,
+                TERRAN_INFANTRY_ARMOR_ID,
+            ],
+            TERRAN_VEHICLE_UPGRADE_ID: [
+                TERRAN_VEHICLE_WEAPON_ID,
+                TERRAN_VEHICLE_ARMOR_ID,
+            ],
+            TERRAN_SHIP_UPGRADE_ID: [
+                TERRAN_SHIP_WEAPON_ID,
+                TERRAN_SHIP_ARMOR_ID
+            ],
+            ZERG_WEAPON_UPGRADE_ID: [
+                ZERG_MELEE_ATTACK_ID,
+                ZERG_MISSILE_ATTACK_ID,
+                ZERG_FLYER_ATTACK_ID,
+            ],
+            ZERG_ARMOR_UPGRADE_ID: [
+                ZERG_GROUND_CARAPACE_ID,
+                ZERG_FLYER_CARAPACE_ID,
+            ],
+            ZERG_GROUND_UPGRADE_ID: [
+                ZERG_MELEE_ATTACK_ID,
+                ZERG_MISSILE_ATTACK_ID,
+                ZERG_GROUND_CARAPACE_ID,
+            ],
+            ZERG_FLYER_UPGRADE_ID: [
+                ZERG_FLYER_ATTACK_ID,
+                ZERG_FLYER_CARAPACE_ID,
+            ],
+            PROTOSS_WEAPON_UPGRADE_ID: [
+                PROTOSS_GROUND_WEAPON_ID,
+                PROTOSS_AIR_WEAPON_ID,
+            ],
+            PROTOSS_ARMOR_UPGRADE_ID: [
+                PROTOSS_GROUND_ARMOR_ID,
+                PROTOSS_SHIELDS_ID,
+                PROTOSS_AIR_ARMOR_ID,
+            ],
+            PROTOSS_GROUND_UPGRADE_ID: [
+                PROTOSS_GROUND_WEAPON_ID,
+                PROTOSS_GROUND_ARMOR_ID,
+                PROTOSS_SHIELDS_ID,
+            ],
+            PROTOSS_AIR_UPGRADE_ID: [
+                PROTOSS_AIR_WEAPON_ID,
+                PROTOSS_AIR_ARMOR_ID,
+                PROTOSS_SHIELDS_ID,
+            ]
         }
-        grouped_item_replacements["Progressive Weapon/Armor Upgrade"] = grouped_item_replacements[
-                                                                            "Progressive Weapon Upgrade"] + \
-                                                                        grouped_item_replacements[
-                                                                            "Progressive Armor Upgrade"]
-        replacement_item_ids = {
-            "Progressive Infantry Weapon": 100 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Infantry Armor":  102 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Vehicle Weapon":  103 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Vehicle Armor":   104 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Ship Weapon":     105 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Ship Armor":      106 + SC2WOL_ITEM_ID_OFFSET,
-        }
+        grouped_item_replacements[TERRAN_WEAPON_ARMOR_UPGRADE_ID] = (
+            grouped_item_replacements[TERRAN_WEAPON_UPGRADE_ID]
+            + grouped_item_replacements[TERRAN_ARMOR_UPGRADE_ID]
+        )
+        grouped_item_replacements[ZERG_WEAPON_ARMOR_UPGRADE_ID] = (
+            grouped_item_replacements[ZERG_WEAPON_UPGRADE_ID]
+            + grouped_item_replacements[ZERG_ARMOR_UPGRADE_ID]
+        )
+        grouped_item_replacements[PROTOSS_WEAPON_ARMOR_UPGRADE_ID] = (
+            grouped_item_replacements[PROTOSS_WEAPON_UPGRADE_ID]
+            + grouped_item_replacements[PROTOSS_ARMOR_UPGRADE_ID]
+        )
+        for bundle_id, upgrade_ids in grouped_item_replacements.items():
+            bundle_amount = inventory[bundle_id]
+            for upgrade_id in upgrade_ids:
+                if bundle_amount > inventory[upgrade_id]:
+                    # Only assign, don't add.
+                    # This behaviour mimics protoss shields, where the output is
+                    # the maximum bundle contribution, not the sum
+                    inventory[upgrade_id] = bundle_amount
 
-        inventory = tracker_data.get_player_inventory_counts(team, player)
-        for grouped_item_name, grouped_item_id in grouped_item_ids.items():
-            count: int = inventory[grouped_item_id]
-            if count > 0:
-                for replacement_item in grouped_item_replacements[grouped_item_name]:
-                    replacement_id: int = replacement_item_ids[replacement_item]
-                    inventory[replacement_id] = count
-
-        # Determine display for progressive items
-        progressive_items = {
-            "Progressive Infantry Weapon":                    100 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Infantry Armor":                     102 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Vehicle Weapon":                     103 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Vehicle Armor":                      104 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Ship Weapon":                        105 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Ship Armor":                         106 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Stimpack (Marine)":                  208 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Stimpack (Firebat)":                 226 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Stimpack (Marauder)":                228 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Stimpack (Reaper)":                  250 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Stimpack (Hellion)":                 259 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive High Impact Payload (Thor)":         361 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Cross-Spectrum Dampeners (Banshee)": 316 + SC2WOL_ITEM_ID_OFFSET,
-            "Progressive Regenerative Bio-Steel":             617 + SC2WOL_ITEM_ID_OFFSET
-        }
-        progressive_names = {
-            "Progressive Infantry Weapon":                    ["Infantry Weapons Level 1", "Infantry Weapons Level 1",
-                                                               "Infantry Weapons Level 2", "Infantry Weapons Level 3"],
-            "Progressive Infantry Armor":                     ["Infantry Armor Level 1", "Infantry Armor Level 1",
-                                                               "Infantry Armor Level 2", "Infantry Armor Level 3"],
-            "Progressive Vehicle Weapon":                     ["Vehicle Weapons Level 1", "Vehicle Weapons Level 1",
-                                                               "Vehicle Weapons Level 2", "Vehicle Weapons Level 3"],
-            "Progressive Vehicle Armor":                      ["Vehicle Armor Level 1", "Vehicle Armor Level 1",
-                                                               "Vehicle Armor Level 2", "Vehicle Armor Level 3"],
-            "Progressive Ship Weapon":                        ["Ship Weapons Level 1", "Ship Weapons Level 1",
-                                                               "Ship Weapons Level 2", "Ship Weapons Level 3"],
-            "Progressive Ship Armor":                         ["Ship Armor Level 1", "Ship Armor Level 1",
-                                                               "Ship Armor Level 2", "Ship Armor Level 3"],
-            "Progressive Stimpack (Marine)":                  ["Stimpack (Marine)", "Stimpack (Marine)",
-                                                               "Super Stimpack (Marine)"],
-            "Progressive Stimpack (Firebat)":                 ["Stimpack (Firebat)", "Stimpack (Firebat)",
-                                                               "Super Stimpack (Firebat)"],
-            "Progressive Stimpack (Marauder)":                ["Stimpack (Marauder)", "Stimpack (Marauder)",
-                                                               "Super Stimpack (Marauder)"],
-            "Progressive Stimpack (Reaper)":                  ["Stimpack (Reaper)", "Stimpack (Reaper)",
-                                                               "Super Stimpack (Reaper)"],
-            "Progressive Stimpack (Hellion)":                 ["Stimpack (Hellion)", "Stimpack (Hellion)",
-                                                               "Super Stimpack (Hellion)"],
-            "Progressive High Impact Payload (Thor)":         ["High Impact Payload (Thor)",
-                                                               "High Impact Payload (Thor)", "Smart Servos (Thor)"],
-            "Progressive Cross-Spectrum Dampeners (Banshee)": ["Cross-Spectrum Dampeners (Banshee)",
-                                                               "Cross-Spectrum Dampeners (Banshee)",
-                                                               "Advanced Cross-Spectrum Dampeners (Banshee)"],
-            "Progressive Regenerative Bio-Steel":             ["Regenerative Bio-Steel Level 1",
-                                                               "Regenerative Bio-Steel Level 1",
-                                                               "Regenerative Bio-Steel Level 2"]
-        }
-        for item_name, item_id in progressive_items.items():
-            level = min(inventory[item_id], len(progressive_names[item_name]) - 1)
-            display_name = progressive_names[item_name][level]
-            base_name = (item_name.split(maxsplit=1)[1].lower()
-                         .replace(' ', '_')
-                         .replace("-", "")
-                         .replace("(", "")
-                         .replace(")", ""))
-            display_data[base_name + "_level"] = level
-            display_data[base_name + "_url"] = icons[display_name]
-            display_data[base_name + "_name"] = display_name
-
-        # Multi-items
-        multi_items = {
-            "+15 Starting Minerals": 800 + SC2WOL_ITEM_ID_OFFSET,
-            "+15 Starting Vespene":  801 + SC2WOL_ITEM_ID_OFFSET,
-            "+2 Starting Supply":    802 + SC2WOL_ITEM_ID_OFFSET
-        }
-        for item_name, item_id in multi_items.items():
-            base_name = item_name.split()[-1].lower()
-            count = inventory[item_id]
-            if base_name == "supply":
-                count = count * 2
-                display_data[base_name + "_count"] = count
-            else:
-                count = count * 15
-                display_data[base_name + "_count"] = count
 
         # Victory condition
         game_state = tracker_data.get_player_client_status(team, player)
-        display_data["game_finished"] = game_state == 30
+        display_data["game_finished"] = game_state == ClientStatus.CLIENT_GOAL
 
-        # Turn location IDs into mission objective counts
-        locations = tracker_data.get_player_locations(team, player)
-        checked_locations = tracker_data.get_player_checked_locations(team, player)
-        lookup_name = lambda id: tracker_data.location_id_to_name["Starcraft 2 Wings of Liberty"][id]
-        location_info = {mission_name: {lookup_name(id): (id in checked_locations) for id in mission_locations if
-                                        id in set(locations)} for mission_name, mission_locations in
-                         sc2wol_location_ids.items()}
-        checks_done = {mission_name: len(
-            [id for id in mission_locations if id in checked_locations and id in set(locations)]) for
-                       mission_name, mission_locations in sc2wol_location_ids.items()}
-        checks_done['Total'] = len(checked_locations)
-        checks_in_area = {mission_name: len([id for id in mission_locations if id in set(locations)]) for
-                          mission_name, mission_locations in sc2wol_location_ids.items()}
-        checks_in_area['Total'] = sum(checks_in_area.values())
+        # Keys
+        keys: dict[str, int] = {}
+        for item_id, item_count in inventory.items():
+            if item_id < SC2_KEY_ITEM_ID_OFFSET:
+                continue
+            keys[item_id_to_name[item_id]] = item_count
 
-        lookup_any_item_id_to_name = tracker_data.item_id_to_name["Starcraft 2 Wings of Liberty"]
         return render_template(
-            "tracker__Starcraft2WingsOfLiberty.html",
+            "tracker__Starcraft2.html",
             inventory=inventory,
-            icons=icons,
-            acquired_items={lookup_any_item_id_to_name[id] for id, count in inventory.items() if count > 0},
             player=player,
             team=team,
             room=tracker_data.room,
-            player_name=tracker_data.get_player_name(team, player),
-            checks_done=checks_done,
-            checks_in_area=checks_in_area,
-            location_info=location_info,
+            player_name=tracker_data.get_player_name(player),
+            missions=missions,
+            locations=locations,
+            checked_locations=checked_locations,
+            location_id_to_name=location_id_to_name,
+            item_id_to_name=item_id_to_name,
+            keys=keys,
+            saving_second=tracker_data.get_room_saving_second(),
             **display_data,
         )
 
-    _player_trackers["Starcraft 2 Wings of Liberty"] = render_Starcraft2WingsOfLiberty_tracker
+
+    _player_trackers["Starcraft 2"] = render_Starcraft2_tracker

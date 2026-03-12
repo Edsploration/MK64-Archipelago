@@ -39,8 +39,8 @@ options.
 
 ### Where do I get a config file?
 
-The [Player Settings](/games/Lufia%20II%20Ancient%20Cave/player-settings) page on the website allows you to configure
-your personal settings and export a config file from them.
+The [Player Options](/games/Lufia%20II%20Ancient%20Cave/player-options) page on the website allows you to configure
+your personal options and export a config file from them.
 
 ### Verifying your config file
 
@@ -49,7 +49,7 @@ If you would like to validate your config file to make sure it works, you may do
 
 ## Generating a Single-Player Game
 
-1. Navigate to the [Player Settings](/games/Lufia%20II%20Ancient%20Cave/player-settings) page, configure your options,
+1. Navigate to the [Player Options](/games/Lufia%20II%20Ancient%20Cave/player-options) page, configure your options,
    and click the "Generate Game" button.
 2. You will be presented with a "Seed Info" page.
 3. Click the "Create New Room" link.
@@ -106,9 +106,8 @@ You only have to do these steps once. Note, RetroArch 1.9.x will not work as it 
 1. Enter the RetroArch main menu screen.
 2. Go to Settings --> User Interface. Set "Show Advanced Settings" to ON.
 3. Go to Settings --> Network. Set "Network Commands" to ON. (It is found below Request Device 16.) Leave the default
-   Network Command Port at 55355.
-
-![Screenshot of Network Commands setting](/static/generated/docs/A%20Link%20to%20the%20Past/retroarch-network-commands-en.png)
+   Network Command Port at 55355. \
+   ![Screenshot of Network Commands setting](../../generic/docs/retroarch-network-commands-en.png)
 4. Go to Main Menu --> Online Updater --> Core Downloader. Scroll down and select "Nintendo - SNES / SFC (bsnes-mercury
    Performance)".
 

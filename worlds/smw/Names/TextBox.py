@@ -1,5 +1,5 @@
 
-from BaseClasses import MultiWorld
+from worlds.AutoWorld import World
 
 import math
 
@@ -63,21 +63,23 @@ def generate_text_box(input_string):
     return out_bytes
 
 
-def generate_goal_text(world: MultiWorld, player: int):
+def generate_goal_text(world: World):
     out_array = bytearray()
-    if world.goal[player] == "yoshi_egg_hunt":
-        required_yoshi_eggs = max(math.floor(
-                world.number_of_yoshi_eggs[player].value * (world.percentage_of_yoshi_eggs[player].value / 100.0)), 1)
+    if world.options.goal == "yoshi_egg_hunt":
+        required_yoshi_eggs = world.required_egg_count
+        actual_yoshi_eggs = world.actual_egg_count
         out_array += bytearray([0x9F, 0x9F])
         out_array += string_to_bytes(" You must acquire")
         out_array[-1] += 0x80
-        out_array += string_to_bytes(f'  {required_yoshi_eggs:02} Yoshi Eggs,')
+        out_array += string_to_bytes(f'    {required_yoshi_eggs:03} of {actual_yoshi_eggs:03}')
+        out_array[-1] += 0x80
+        out_array += string_to_bytes(f'    Yoshi Eggs,')
         out_array[-1] += 0x80
         out_array += string_to_bytes("then return here.")
         out_array[-1] += 0x80
-        out_array += bytearray([0x9F, 0x9F, 0x9F])
+        out_array += bytearray([0x9F, 0x9F])
     else:
-        bosses_required = world.bosses_required[player].value
+        bosses_required = world.options.bosses_required.value
         out_array += bytearray([0x9F, 0x9F])
         out_array += string_to_bytes(" You must defeat")
         out_array[-1] += 0x80
@@ -101,6 +103,31 @@ def generate_received_text(item_name: str, player_name: str):
 
     out_array += bytearray([0x9F, 0x9F])
     out_array += string_to_bytes("     Received")
+    out_array[-1] += 0x80
+    out_array += bytearray([0x1F] * item_buffer)
+    out_array += string_to_bytes(item_name)
+    out_array[-1] += 0x80
+    out_array += string_to_bytes("       from")
+    out_array[-1] += 0x80
+    out_array += bytearray([0x1F] * player_buffer)
+    out_array += string_to_bytes(player_name)
+    out_array[-1] += 0x80
+    out_array += bytearray([0x9F, 0x9F])
+
+    return out_array
+
+
+def generate_received_trap_link_text(item_name: str, player_name: str):
+    out_array = bytearray()
+
+    item_name = item_name[:18]
+    player_name = player_name[:18]
+
+    item_buffer = max(0, math.floor((18 - len(item_name)) / 2))
+    player_buffer = max(0, math.floor((18 - len(player_name)) / 2))
+
+    out_array += bytearray([0x9F, 0x9F])
+    out_array += string_to_bytes(" Received linked")
     out_array[-1] += 0x80
     out_array += bytearray([0x1F] * item_buffer)
     out_array += string_to_bytes(item_name)

@@ -44,8 +44,8 @@ guide: [Basic Multiworld Setup Guide](/tutorial/Archipelago/setup/en)
 
 ### Where do I get a config file?
 
-The Player Settings page on the website allows you to configure your personal settings and export a config file from
-them. Player settings page: [Super Mario World Player Settings Page](/games/Super%20Mario%20World/player-settings)
+The Player Options page on the website allows you to configure your personal options and export a config file from
+them. Player options page: [Super Mario World Player Options Page](/games/Super%20Mario%20World/player-options)
 
 ### Verifying your config file
 
@@ -100,9 +100,8 @@ You only have to do these steps once. Note, RetroArch 1.9.x will not work as it 
 1. Enter the RetroArch main menu screen.
 2. Go to Settings --> User Interface. Set "Show Advanced Settings" to ON.
 3. Go to Settings --> Network. Set "Network Commands" to ON. (It is found below Request Device 16.) Leave the default
-   Network Command Port at 55355.
-
-![Screenshot of Network Commands setting](/static/generated/docs/A%20Link%20to%20the%20Past/retroarch-network-commands-en.png)
+   Network Command Port at 55355. \
+   ![Screenshot of Network Commands setting](../../generic/docs/retroarch-network-commands-en.png)
 4. Go to Main Menu --> Online Updater --> Core Downloader. Scroll down and select "Nintendo - SNES / SFC (bsnes-mercury
    Performance)".
 

@@ -45,8 +45,8 @@ guide: [Basic Multiworld Setup Guide](/tutorial/Archipelago/setup/en)
 
 ### Where do I get a config file?
 
-The Player Settings page on the website allows you to configure your personal settings and export a config file from
-them. Player settings page: [Donkey Kong Country 3 Player Settings Page](/games/Donkey%20Kong%20Country%203/player-settings)
+The Player Options page on the website allows you to configure your personal options and export a config file from
+them. Player options page: [Donkey Kong Country 3 Player Options Page](/games/Donkey%20Kong%20Country%203/player-options)
 
 ### Verifying your config file
 
@@ -55,8 +55,8 @@ validator page: [YAML Validation page](/check)
 
 ## Generating a Single-Player Game
 
-1. Navigate to the Player Settings page, configure your options, and click the "Generate Game" button.
-    - Player Settings page: [Donkey Kong Country 3 Player Settings Page](/games/Donkey%20Kong%20Country%203/player-settings)
+1. Navigate to the Player Options page, configure your options, and click the "Generate Game" button.
+    - Player Options page: [Donkey Kong Country 3 Player Options Page](/games/Donkey%20Kong%20Country%203/player-options)
 2. You will be presented with a "Seed Info" page.
 3. Click the "Create New Room" link.
 4. You will be presented with a server page, from which you can download your patch file.
@@ -111,9 +111,8 @@ You only have to do these steps once. Note, RetroArch 1.9.x will not work as it 
 1. Enter the RetroArch main menu screen.
 2. Go to Settings --> User Interface. Set "Show Advanced Settings" to ON.
 3. Go to Settings --> Network. Set "Network Commands" to ON. (It is found below Request Device 16.) Leave the default
-   Network Command Port at 55355.
-
-![Screenshot of Network Commands setting](/static/generated/docs/A%20Link%20to%20the%20Past/retroarch-network-commands-en.png)
+   Network Command Port at 55355. \
+  ![Screenshot of Network Commands setting](../../generic/docs/retroarch-network-commands-en.png)
 4. Go to Main Menu --> Online Updater --> Core Downloader. Scroll down and select "Nintendo - SNES / SFC (bsnes-mercury
    Performance)".
 
