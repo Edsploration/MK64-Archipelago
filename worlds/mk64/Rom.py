@@ -72,6 +72,108 @@ class Addr:
     RECEIVE_ITEM_NAME = RECEIVE_PLAYER_NAME + ASCII_PLAYER_NAME_SIZE
 
 
+class Rom:
+    def __init__(self, file):
+        self.orig_buffer = None
+        base_rom_bytes = get_base_rom_bytes(file)
+        patch_bytes = pkgutil.get_data(__name__, "data/mk64-ap-basepatch.bsdiff")
+        self.buffer = bytearray(bsdiff4.patch(base_rom_bytes, patch_bytes))
+
+    def read_bit(self, address: int, bit_number: int) -> bool:
+        bitflag = (1 << bit_number)
+        return (self.buffer[address] & bitflag) != 0
+
+    def read_byte(self, address: int) -> int:
+        return self.buffer[address]
+
+    def read_bytes(self, startaddress: int, length: int) -> bytes:
+        return self.buffer[startaddress:startaddress + length]
+
+    def write_byte(self, address: int, value: int):
+        self.buffer[address] = value
+
+    def write_bytes(self, startaddress: int, values: list | bytes | bytearray):
+        self.buffer[startaddress:startaddress + len(values)] = values
+
+    def write_int16(self, address, value: int):
+        value = value & 0xFFFF
+        self.write_bytes(address, [(value >> 8) & 0xFF, value & 0xFF])
+
+    def write_int16s(self, startaddress, values: list):
+        for i, value in enumerate(values):
+            self.write_int16(startaddress + (i * 2), value)
+
+    def write_int24(self, address, value: int):
+        value = value & 0xFFFFFF
+        self.write_bytes(address, [(value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
+
+    def write_int24s(self, startaddress, values: list):
+        for i, value in enumerate(values):
+            self.write_int24(startaddress + (i * 3), value)
+
+    def write_int32(self, address, value: int):
+        value = value & 0xFFFFFFFF
+        self.write_bytes(address, [(value >> 24) & 0xFF, (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
+
+    def write_int32s(self, startaddress, values: list):
+        for i, value in enumerate(values):
+            self.write_int32(startaddress + (i * 4), value)
+
+    def write_to_file(self, file):
+        with open(file, 'wb') as outfile:
+            outfile.write(self.buffer)
+
+    def read_from_file(self, file):
+        with open(file, 'rb') as stream:
+            self.buffer = bytearray(stream.read())
+
+    # Adapted from espeon65536's version in oot/data/crc.py
+    def calculate_crc_6102(self):
+
+        t1 = t2 = t3 = t4 = t5 = t6 = 0xF8CA4DDC
+        u32 = 0xFFFFFFFF
+
+        m1 = self.read_bytes(0x1000, 0x100000)
+        words = struct.unpack(f'>{len(m1)//4}I', m1)
+
+        m2 = self.read_bytes(0x750, 0x100)
+        words2 = struct.unpack(f'>{len(m2)//4}I', m2)
+
+        for d, d2 in zip(words, itertools.cycle(words2)):
+            # keep t2 and t6 in u32 for comparisons; others can wait to be truncated
+            if ((t6 + d) & u32) < t6:
+                t4 += 1
+
+            t6 = (t6+d) & u32
+            t3 ^= d
+            shift = d & 0x1F
+            r = ((d << shift) | (d >> (32 - shift)))
+            t5 += r
+
+            if t2 > d:
+                t2 ^= r & u32
+            else:
+                t2 ^= t6 ^ d
+
+            t1 += t5 ^ d
+
+        crc0 = (t6 ^ t4 ^ t3) & u32
+        crc1 = (t5 ^ t2 ^ t1) & u32
+
+        return struct.pack('>II', crc0, crc1)
+
+
+class MK64DeltaPatch(APDeltaPatch):
+    hash = "3a67d9986f54eb282924fca4cd5f6dff"
+    patch_file_ending = ".apmk64"
+    result_file_ending = ".z64"
+    game = "Mario Kart 64"
+
+    @classmethod
+    def get_source_data(cls) -> bytes:
+        return get_base_rom_bytes()
+
+
 def generate_rom_patch(world: "MK64World", output_directory: str) -> None:
     multiworld = world.multiworld
     player = world.player
@@ -232,105 +334,3 @@ def get_base_rom_bytes(file_name: str = "") -> bytes:
                             'Please provide the correct ROM version.')
         get_base_rom_bytes.base_rom_bytes = base_rom_bytes
     return base_rom_bytes
-
-
-class MK64DeltaPatch(APDeltaPatch):
-    hash = "3a67d9986f54eb282924fca4cd5f6dff"
-    patch_file_ending = ".apmk64"
-    result_file_ending = ".z64"
-    game = "Mario Kart 64"
-
-    @classmethod
-    def get_source_data(cls) -> bytes:
-        return get_base_rom_bytes()
-
-
-class Rom:
-    def __init__(self, file):
-        self.orig_buffer = None
-        base_rom_bytes = get_base_rom_bytes(file)
-        patch_bytes = pkgutil.get_data(__name__, "data/mk64-ap-basepatch.bsdiff")
-        self.buffer = bytearray(bsdiff4.patch(base_rom_bytes, patch_bytes))
-
-    def read_bit(self, address: int, bit_number: int) -> bool:
-        bitflag = (1 << bit_number)
-        return (self.buffer[address] & bitflag) != 0
-
-    def read_byte(self, address: int) -> int:
-        return self.buffer[address]
-
-    def read_bytes(self, startaddress: int, length: int) -> bytes:
-        return self.buffer[startaddress:startaddress + length]
-
-    def write_byte(self, address: int, value: int):
-        self.buffer[address] = value
-
-    def write_bytes(self, startaddress: int, values: list | bytes | bytearray):
-        self.buffer[startaddress:startaddress + len(values)] = values
-
-    def write_int16(self, address, value: int):
-        value = value & 0xFFFF
-        self.write_bytes(address, [(value >> 8) & 0xFF, value & 0xFF])
-
-    def write_int16s(self, startaddress, values: list):
-        for i, value in enumerate(values):
-            self.write_int16(startaddress + (i * 2), value)
-
-    def write_int24(self, address, value: int):
-        value = value & 0xFFFFFF
-        self.write_bytes(address, [(value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
-
-    def write_int24s(self, startaddress, values: list):
-        for i, value in enumerate(values):
-            self.write_int24(startaddress + (i * 3), value)
-
-    def write_int32(self, address, value: int):
-        value = value & 0xFFFFFFFF
-        self.write_bytes(address, [(value >> 24) & 0xFF, (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
-
-    def write_int32s(self, startaddress, values: list):
-        for i, value in enumerate(values):
-            self.write_int32(startaddress + (i * 4), value)
-
-    def write_to_file(self, file):
-        with open(file, 'wb') as outfile:
-            outfile.write(self.buffer)
-
-    def read_from_file(self, file):
-        with open(file, 'rb') as stream:
-            self.buffer = bytearray(stream.read())
-
-    # Adapted from espeon65536's version in oot/data/crc.py
-    def calculate_crc_6102(self):
-
-        t1 = t2 = t3 = t4 = t5 = t6 = 0xF8CA4DDC
-        u32 = 0xFFFFFFFF
-
-        m1 = self.read_bytes(0x1000, 0x100000)
-        words = struct.unpack(f'>{len(m1)//4}I', m1)
-
-        m2 = self.read_bytes(0x750, 0x100)
-        words2 = struct.unpack(f'>{len(m2)//4}I', m2)
-
-        for d, d2 in zip(words, itertools.cycle(words2)):
-            # keep t2 and t6 in u32 for comparisons; others can wait to be truncated
-            if ((t6 + d) & u32) < t6:
-                t4 += 1
-
-            t6 = (t6+d) & u32
-            t3 ^= d
-            shift = d & 0x1F
-            r = ((d << shift) | (d >> (32 - shift)))
-            t5 += r
-
-            if t2 > d:
-                t2 ^= r & u32
-            else:
-                t2 ^= t6 ^ d
-
-            t1 += t5 ^ d
-
-        crc0 = (t6 ^ t4 ^ t3) & u32
-        crc1 = (t5 ^ t2 ^ t1) & u32
-
-        return struct.pack('>II', crc0, crc1)
