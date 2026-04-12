@@ -46,6 +46,7 @@ class Addr:
     COURSE_NAMEPLATES = 0x12F772
     RESULTS_MUSIC_REPETITIONS = 0xBDA883
     # ** Basepatch **
+    INITIAL_SOUND_MODE = 0x927AB
     SAVE = 0xC00000
     SAVE_SIZE = 0x200
     SAVE_LOCKED_ITEM_CLUSTERS = SAVE + 0x1B
@@ -147,6 +148,7 @@ def write_tokens(world: "MK64World", patch: MK64ProcedurePatch, output_directory
             mirror_courses |= 1 << i
     two_lap_mapping = {0: 0, 1: 0x8000, 2: 0x0100, 3: 0x8100}
     two_lap_courses = two_lap_mapping[opt.two_lap_courses]
+    write_value(patch, Addr.INITIAL_SOUND_MODE, opt.sound_mode)
     write_value(patch, Addr.TWO_PLAYER_POWERS, opt.two_player)
     write_value(patch, Addr.GAME_MODE, opt.mode)
     write_value(patch, Addr.FREE_MINI_TURBO, opt.drift == ShuffleDriftAbilities.option_free_mini_turbo)

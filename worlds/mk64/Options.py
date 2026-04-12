@@ -288,13 +288,12 @@ class FixResultsMusic(DefaultOnToggle):
     display_name = "Fix Winning Results Music"
 
 
-class SoundMode(Choice):    # TODO: Add support for this
-    """(NOT YET SUPPORTED)
-    Sets the sound mode in the game's option menu ahead of time."""
+class SoundMode(Choice):
+    """Sets the sound mode in the game's option menu ahead of time."""
     display_name = "Sound Mode"
     option_stereo = 0
     option_headphones = 1
-    option_mono = 2
+    option_mono = 3
     default = 0
 
 
@@ -365,3 +364,4 @@ class Opt:
         self.middle_engine =   world.options.middle_engine_class.value
         self.high_engine =     world.options.high_engine_class.value
         self.fix_music =       world.options.fix_results_music.value
+        self.sound_mode =      world.options.sound_mode.value
