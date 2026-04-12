@@ -1,4 +1,5 @@
 import typing
+import hashlib
 
 import settings
 from BaseClasses import Item, Tutorial
@@ -57,6 +58,7 @@ class MK64World(World):
     data_version = 2
 
     opt: Opt
+    hash_seed: int
     num_filler_items: int
     shuffle_clusters: list[bool]
     filler_spots: list[bool]
@@ -116,6 +118,9 @@ class MK64World(World):
             opt.high_engine = self.random.randrange(opt.middle_engine + 25, 201)
         elif opt.high_engine < opt.middle_engine + 25:
             opt.high_engine = opt.middle_engine + 25
+        # Hash Seed
+        seed_player_bytes = f"{self.multiworld.seed}{self.player}".encode()
+        self.hash_seed = int.from_bytes(hashlib.md5(seed_player_bytes).digest()[:4], "big")
 
     def create_regions(self) -> None:
         Regions.create_regions_locations_connections(self)
@@ -138,7 +143,7 @@ class MK64World(World):
 
     def modify_multidata(self, multidata: dict) -> None:
         player_name = self.multiworld.player_name[self.player]
-        slot_name = player_name + "_" + self.multiworld.seed_name
+        slot_name = f"{player_name}_{self.hash_seed:X}"
         multidata["connect_names"][slot_name] = multidata["connect_names"][player_name]
 
     def fill_slot_data(self) -> dict[str, any]:
@@ -163,4 +168,12 @@ class MK64World(World):
             "high_engine_class"
         )
         slot_data["course_order"] = self.course_order
+        slot_data["hash_seed"] = self.hash_seed
         return slot_data
+
+    def hash41(self, value: int) -> int:
+        value += self.hash_seed
+        value ^= value >> 5
+        value = value * 0x8ED05D69 & 0xFFFFFFFF
+        value ^= value >> 5
+        return value + (value >> 8) + (value >> 16) - (value >> 24) & 0xFF

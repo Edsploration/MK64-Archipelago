@@ -57,9 +57,7 @@ class Addr:
     SAVE_IDENTIFIED_ITEM_BOXES_SIZE = 43
     PLAYER_NAME = SAVE + SAVE_SIZE
     PLAYER_NAME_SIZE = 64
-    SEED_NAME = PLAYER_NAME + PLAYER_NAME_SIZE
-    SEED_NAME_SIZE = 20
-    GENERATION_DONE = SEED_NAME + SEED_NAME_SIZE
+    GENERATION_DONE = PLAYER_NAME + PLAYER_NAME_SIZE + 20
     GENERATION_LOCKED = GENERATION_DONE + 1
     # Game Settings
     TWO_PLAYER_POWERS = GENERATION_LOCKED + 1
@@ -99,7 +97,6 @@ def write_tokens(world: "MK64World", patch: MK64ProcedurePatch, output_directory
     random = world.random
 
     # Patch save file
-    save_id = hashlib.md5((multiworld.seed_name + multiworld.player_name[player]).encode()).digest()[:8]
     locked_courses = 0xFFFF << 16 - opt.locked_courses & 0xFFFF
     drift = ((opt.drift == ShuffleDriftAbilities.option_off and 0xAAAA) or
              (opt.drift == ShuffleDriftAbilities.option_free_drift and 0x5555) or 0)
@@ -112,7 +109,6 @@ def write_tokens(world: "MK64World", patch: MK64ProcedurePatch, output_directory
     misc_byte = 1 if opt.box_respawning else 0b101  # game_clear (initially 0), connected status bit (always 1)
 
     # Pack to bytes ordered to the basepatch's SaveData struct bitfields
-    write_bytes(patch, Addr.SAVE, save_id)  # replaces DATETIME pseudo-hash in basepatch
     write_value(patch, Addr.SAVE + 0x8, locked_courses, 2)
     write_value(patch, Addr.SAVE + 0xA, drift, 2)
     write_value(patch, Addr.SAVE + 0xF, blues)
@@ -120,6 +116,7 @@ def write_tokens(world: "MK64World", patch: MK64ProcedurePatch, output_directory
     write_value(patch, Addr.SAVE + 0x15, tires_off_road)
     write_value(patch, Addr.SAVE + 0x16, tires_winter)
     write_value(patch, Addr.SAVE + 0x17, (locked_cups << 4) | switches)
+    write_value(patch, Addr.SAVE, world.hash_seed, 4)
     write_value(patch, Addr.SAVE + 0x19, misc_byte)
 
     # Patch Locked Item Clusters
@@ -133,13 +130,8 @@ def write_tokens(world: "MK64World", patch: MK64ProcedurePatch, output_directory
     player_name_bytes = multiworld.player_name[player].encode("utf-8")
     if len(player_name_bytes) > 64:
         raise ValueError(f"Player name {multiworld.player_name[player]} was longer than the 64 byte expectation.")
-    write_bytes(patch, Addr.PLAYER_NAME, [0] * Addr.PLAYER_NAME_SIZE)
     write_bytes(patch, Addr.PLAYER_NAME, player_name_bytes)
-    seed_name_bytes = multiworld.seed_name.encode("utf-8")
-    if len(seed_name_bytes) > 20:
-        raise ValueError(f"Multiworld.seed_name {multiworld.seed_name} was longer than the 20 byte expectation.")
-    write_bytes(patch, Addr.SEED_NAME, [0] * Addr.SEED_NAME_SIZE)
-    write_bytes(patch, Addr.SEED_NAME, seed_name_bytes)
+    write_bytes(patch, Addr.PLAYER_NAME + len(player_name_bytes), [0xFE] * (64 - len(player_name_bytes)))
 
     # Patch game settings
     mirror_courses = 0
